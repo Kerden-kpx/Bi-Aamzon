@@ -1,0 +1,23 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bi-amazon-backend
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    # Use host machine MySQL instead of a MySQL container.
+    # In backend/.env set DB_HOST=host.docker.internal (or host gateway IP).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./files:/app/files
+    ports:
+      - "18765:18765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18765/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
