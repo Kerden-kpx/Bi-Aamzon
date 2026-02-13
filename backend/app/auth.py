@@ -3,7 +3,6 @@ import hashlib
 import hmac
 import json
 import os
-import sys
 import time
 import urllib.parse
 import urllib.request
@@ -13,6 +12,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from .core.config import get_auth_secret_or_raise
+from .core.logging import get_request_id, logger
 from .db import execute, fetch_one
 
 
@@ -47,6 +48,13 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _get_auth_secret() -> str:
+    try:
+        return get_auth_secret_or_raise()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _b64url(data: bytes) -> str:
@@ -87,12 +95,18 @@ def _verify_token(token: str, secret: str) -> Dict[str, Any]:
 def _http_get_json(url: str, params: Dict[str, str], timeout: int) -> Dict[str, Any]:
     query = urllib.parse.urlencode(params)
     full_url = f"{url}?{query}" if query else url
+    endpoint = str(url or "").split("?")[0]
     try:
         with urllib.request.urlopen(full_url, timeout=timeout) as resp:
             data = resp.read().decode("utf-8")
         return json.loads(data)
     except Exception as exc:
-        print(f"[DingTalk] HTTP GET failed: {full_url} ({exc})", file=sys.stderr)
+        logger.warning(
+            "dingtalk_http_get_failed endpoint=%s rid=%s err=%s",
+            endpoint,
+            get_request_id(),
+            exc,
+        )
         raise
 
 
@@ -104,12 +118,18 @@ def _http_post_json(url: str, body: Dict[str, Any], timeout: int) -> Dict[str, A
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    endpoint = str(url or "").split("?")[0]
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read().decode("utf-8")
         return json.loads(data)
     except Exception as exc:
-        print(f"[DingTalk] HTTP POST failed: {url} ({exc})", file=sys.stderr)
+        logger.warning(
+            "dingtalk_http_post_failed endpoint=%s rid=%s err=%s",
+            endpoint,
+            get_request_id(),
+            exc,
+        )
         raise
 
 
@@ -117,8 +137,21 @@ def _ensure_ok(resp: Dict[str, Any], context: str) -> None:
     errcode = resp.get("errcode")
     if errcode not in (0, None):
         errmsg = resp.get("errmsg") or resp.get("message") or "unknown error"
-        print(f"[DingTalk] {context} failed: errcode={errcode}, errmsg={errmsg}", file=sys.stderr)
-        raise HTTPException(status_code=502, detail=f"{context} failed: {errmsg}")
+        logger.warning(
+            "dingtalk_api_error code=DINGTALK_API_ERROR context=%s errcode=%s errmsg=%s rid=%s",
+            context,
+            errcode,
+            errmsg,
+            get_request_id(),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"{context} failed: {errmsg}",
+                "code": "DINGTALK_API_ERROR",
+                "details": {"errcode": errcode, "context": context},
+            },
+        )
 
 
 _TOKEN_CACHE: Dict[str, Any] = {"token": None, "expires_at": 0}
@@ -476,7 +509,7 @@ def login_with_auth_code(payload: DingTalkLoginPayload) -> Dict[str, Any]:
     user = _upsert_user(userid, username, avatar_url, default_role)
     if user.get("status") == "disabled":
         raise HTTPException(status_code=403, detail="User disabled")
-    secret = _env("AUTH_SECRET", "dev-secret")
+    secret = _get_auth_secret()
     exp = int(time.time()) + _env_int("AUTH_TOKEN_TTL", 86400)
     token = _sign_token(
         {"sub": userid, "name": user.get("dingtalk_username"), "role": user.get("role"), "exp": exp},
@@ -490,7 +523,7 @@ def get_current_user(request: Request) -> CurrentUser:
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
     token = auth.replace("Bearer ", "", 1).strip()
-    secret = _env("AUTH_SECRET", "dev-secret")
+    secret = _get_auth_secret()
     payload = _verify_token(token, secret)
 
     userid = payload.get("sub")

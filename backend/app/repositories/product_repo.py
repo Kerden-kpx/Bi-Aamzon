@@ -85,18 +85,24 @@ def fetch_products(site: str, limit: int, offset: int, role: str, userid: str, p
             b.site AS bsr_site,
             b.createtime AS bsr_createtime
         FROM dim_bsr_product p
+        LEFT JOIN (
+            SELECT
+                bi.asin,
+                bi.site,
+                MAX(bi.createtime) AS max_createtime
+            FROM dim_bsr_item bi
+            WHERE bi.site = %s
+            GROUP BY bi.asin, bi.site
+        ) latest
+          ON latest.asin = p.asin
+         AND latest.site = p.site
         LEFT JOIN dim_bsr_item b
-          ON b.asin COLLATE utf8mb4_unicode_ci = p.asin
-         AND b.site = p.site
-         AND b.createtime = (
-            SELECT MAX(b2.createtime)
-            FROM dim_bsr_item b2
-            WHERE b2.asin COLLATE utf8mb4_unicode_ci = p.asin
-              AND b2.site = p.site
-         )
+          ON b.asin = latest.asin
+         AND b.site = latest.site
+         AND b.createtime = latest.max_createtime
         WHERE p.site = %s
     """
-    params: List[Any] = [site]
+    params: List[Any] = [site, site]
     if role != "admin" and product_scope == "restricted":
         sql += """
             AND (
@@ -105,7 +111,7 @@ def fetch_products(site: str, limit: int, offset: int, role: str, userid: str, p
                     SELECT 1
                     FROM dim_product_visibility v
                     WHERE v.operator_userid = %s
-                      AND v.asin COLLATE utf8mb4_unicode_ci = p.asin COLLATE utf8mb4_unicode_ci
+                      AND v.asin = p.asin
                 )
             )
         """
@@ -165,7 +171,7 @@ def restricted_user_can_access_product(asin: str, site: str, userid: str) -> boo
                 SELECT 1
                 FROM dim_product_visibility v
                 WHERE v.operator_userid = %s
-                  AND v.asin COLLATE utf8mb4_unicode_ci = p.asin COLLATE utf8mb4_unicode_ci
+                  AND v.asin = p.asin
             )
           )
         LIMIT 1

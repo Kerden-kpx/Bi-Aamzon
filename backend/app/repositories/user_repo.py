@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from ..core.logging import logger
 from ..db import execute, fetch_all, fetch_one, get_connection
 
 
@@ -222,8 +223,15 @@ def insert_audit_log(
                 datetime.now(),
             ),
         )
-    except Exception:
-        return
+    except Exception as exc:
+        logger.warning(
+            "audit_log_insert_failed code=AUDIT_LOG_INSERT_FAILED module=%s action=%s target_id=%s operator_userid=%s err=%s",
+            module,
+            action,
+            target_id,
+            operator_userid,
+            exc,
+        )
 
 
 def lookup_user_name(userid: str) -> Optional[str]:

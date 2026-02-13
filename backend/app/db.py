@@ -1,11 +1,19 @@
 import os
+import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Sequence
+from urllib.parse import quote_plus
 
 import pymysql
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
+
+from .core.config import get_required_env
 
 load_dotenv()
+_ENGINE: Optional[Engine] = None
+_ENGINE_LOCK = threading.Lock()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -18,13 +26,45 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _build_db_url() -> str:
+    user = quote_plus(get_required_env("DB_USER"))
+    password = quote_plus(get_required_env("DB_PASSWORD"))
+    host = get_required_env("DB_HOST")
+    port = _env_int("DB_PORT", 3306)
+    database = quote_plus(get_required_env("DB_NAME"))
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}?charset=utf8mb4"
+
+
+def _get_engine() -> Engine:
+    global _ENGINE
+    if _ENGINE is not None:
+        return _ENGINE
+
+    with _ENGINE_LOCK:
+        if _ENGINE is not None:
+            return _ENGINE
+        _ENGINE = create_engine(
+            _build_db_url(),
+            pool_size=_env_int("DB_POOL_SIZE", 10),
+            max_overflow=_env_int("DB_MAX_OVERFLOW", 20),
+            pool_timeout=_env_int("DB_POOL_TIMEOUT", 30),
+            pool_recycle=_env_int("DB_POOL_RECYCLE", 1800),
+            pool_pre_ping=True,
+            connect_args={
+                "cursorclass": pymysql.cursors.DictCursor,
+            },
+        )
+    return _ENGINE
+
+
 def get_db_config() -> dict:
+    # Keep this for callers that need connection metadata.
     return {
-        "host": os.getenv("DB_HOST", "121.41.4.126"),
-        "port": _env_int("DB_PORT", 15388),
-        "user": os.getenv("DB_USER", "root"),
-        "password": os.getenv("DB_PASSWORD", "QWERasd2025!"),
-        "database": os.getenv("DB_NAME", "bi_amazon"),
+        "host": get_required_env("DB_HOST"),
+        "port": _env_int("DB_PORT", 3306),
+        "user": get_required_env("DB_USER"),
+        "password": get_required_env("DB_PASSWORD"),
+        "database": get_required_env("DB_NAME"),
         "charset": "utf8mb4",
         "cursorclass": pymysql.cursors.DictCursor,
     }
@@ -32,9 +72,12 @@ def get_db_config() -> dict:
 
 @contextmanager
 def get_connection():
-    conn = pymysql.connect(**get_db_config())
+    conn = _get_engine().raw_connection()
     try:
         yield conn
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import threading
 import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from ..core.celery_app import celery_app
 from ..core.config import normalize_site
 from ..repositories import ai_insight_repo, bsr_repo
-from . import bsr_service
+from . import bsr_ai_service
+
+_AI_INSIGHT_TASK_NAME = "bi_amazon.ai_insight.run"
 
 
 def _normalize_range_days(value: int) -> int:
@@ -29,7 +31,7 @@ def _to_job_item(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _run_ai_insight_job(
+def run_ai_insight_job(
     job_id: str,
     asin: str,
     site: str,
@@ -41,8 +43,8 @@ def _run_ai_insight_job(
         rows = bsr_repo.fetch_bsr_daily_window(asin, site, range_days)
         if not rows:
             raise HTTPException(status_code=404, detail="该 ASIN 在 fact_bsr_daily 暂无可分析数据")
-        summary = bsr_service._build_bsr_ai_summary(rows)
-        report_text = bsr_service._call_openrouter_bsr_ai_insight(asin, site, range_days, rows, summary)
+        summary = bsr_ai_service._build_bsr_ai_summary(rows)
+        report_text = bsr_ai_service._call_openrouter_bsr_ai_insight(asin, site, range_days, rows, summary)
         ai_insight_repo.mark_job_success(job_id, report_text)
     except HTTPException:
         ai_insight_repo.mark_job_failed(job_id)
@@ -69,13 +71,15 @@ def submit_job(
         site=target_site,
         operator_userid=operator_userid,
     )
-    worker = threading.Thread(
-        target=_run_ai_insight_job,
-        args=(job_id, target_asin, target_site, target_range_days, operator_userid),
-        name=f"ai-insight-{job_id[:8]}",
-        daemon=True,
-    )
-    worker.start()
+    try:
+        celery_app.send_task(
+            _AI_INSIGHT_TASK_NAME,
+            args=[job_id, target_asin, target_site, target_range_days, operator_userid],
+        )
+    except Exception as exc:
+        ai_insight_repo.mark_job_failed(job_id)
+        raise HTTPException(status_code=502, detail=f"任务入队失败: {exc}") from exc
+
     row = ai_insight_repo.fetch_job(job_id)
     if not row:
         raise HTTPException(status_code=500, detail="任务创建失败")

@@ -50,7 +50,7 @@ def bsr_mapping_join(role: str, userid: str, site: str) -> Tuple[str, List[Any]]
                 FROM dim_bsr_mapping
                 WHERE site = %s
                 GROUP BY competitor_asin, site, createtime
-            ) m ON m.competitor_asin COLLATE utf8mb4_unicode_ci = b.asin COLLATE utf8mb4_unicode_ci
+            ) m ON m.competitor_asin = b.asin
                AND m.createtime = b.createtime
                AND m.site = b.site
             """,
@@ -67,7 +67,7 @@ def bsr_mapping_join(role: str, userid: str, site: str) -> Tuple[str, List[Any]]
             FROM dim_bsr_mapping
             WHERE owner_userid = %s AND site = %s
             GROUP BY competitor_asin, site, createtime
-        ) m ON m.competitor_asin COLLATE utf8mb4_unicode_ci = b.asin COLLATE utf8mb4_unicode_ci
+        ) m ON m.competitor_asin = b.asin
            AND m.createtime = b.createtime
            AND m.site = b.site
         """,
@@ -113,8 +113,12 @@ def fetch_bsr_items(
 {BSR_ITEM_SELECT_COLUMNS}
             FROM dim_bsr_item b
             {join_sql}
+            JOIN (
+                SELECT MAX(createtime) AS latest_createtime
+                FROM dim_bsr_item
+                WHERE site = %s
+            ) latest ON b.createtime = latest.latest_createtime
             WHERE b.site = %s
-              AND b.createtime = (SELECT MAX(createtime) FROM dim_bsr_item WHERE site = %s)
             ORDER BY b.bsr_rank ASC
             LIMIT %s OFFSET %s
         """
@@ -132,57 +136,25 @@ def fetch_bsr_lookup_row(
     brand: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     join_sql, join_params = bsr_mapping_join(role, userid, site)
-    brand_filter_sql = " AND b.brand = %s" if brand else ""
-    brand_subquery_sql = " AND brand = %s" if brand else ""
+    filters = ["b.site = %s", "b.asin = %s"]
+    params: List[Any] = [*join_params, site, asin]
+    if brand:
+        filters.append("b.brand = %s")
+        params.append(brand)
     if createtime:
-        sql = f"""
-            SELECT
-{BSR_ITEM_SELECT_COLUMNS}
-            FROM dim_bsr_item b
-            {join_sql}
-            WHERE b.site = %s
-              AND b.asin = %s
-              {brand_filter_sql}
-              AND b.createtime = (
-                SELECT MAX(createtime)
-                FROM dim_bsr_item
-                WHERE asin = %s
-                  AND site = %s
-                  {brand_subquery_sql}
-                  AND createtime <= %s
-              )
-            LIMIT 1
-        """
-        params: List[Any] = [*join_params, site, asin]
-        if brand:
-            params.append(brand)
-        params.extend([asin, site])
-        if brand:
-            params.append(brand)
+        filters.append("b.createtime <= %s")
         params.append(createtime)
-    else:
-        sql = f"""
-            SELECT
+
+    where_clause = " AND ".join(filters)
+    sql = f"""
+        SELECT
 {BSR_ITEM_SELECT_COLUMNS}
-            FROM dim_bsr_item b
-            {join_sql}
-            WHERE b.site = %s
-              AND b.asin = %s
-              {brand_filter_sql}
-              AND b.createtime = (
-                SELECT MAX(createtime)
-                FROM dim_bsr_item
-                WHERE asin = %s AND site = %s
-                {brand_subquery_sql}
-              )
-            LIMIT 1
-        """
-        params = [*join_params, site, asin]
-        if brand:
-            params.append(brand)
-        params.extend([asin, site])
-        if brand:
-            params.append(brand)
+        FROM dim_bsr_item b
+        {join_sql}
+        WHERE {where_clause}
+        ORDER BY b.createtime DESC
+        LIMIT 1
+    """
 
     return fetch_one(sql, params)
 
@@ -202,15 +174,19 @@ def fetch_bsr_dates(site: str, limit: int, offset: int) -> List[Dict[str, Any]]:
 def fetch_latest_bsr_product_urls(site: str, limit: int = 100) -> List[Dict[str, Any]]:
     sql = """
         SELECT
-            asin,
-            product_url,
-            createtime
-        FROM dim_bsr_item
-        WHERE site = %s
-          AND createtime = (SELECT MAX(createtime) FROM dim_bsr_item WHERE site = %s)
-          AND product_url IS NOT NULL
-          AND TRIM(product_url) <> ''
-        ORDER BY bsr_rank ASC, asin ASC
+            b.asin,
+            b.product_url,
+            b.createtime
+        FROM dim_bsr_item b
+        JOIN (
+            SELECT MAX(createtime) AS latest_createtime
+            FROM dim_bsr_item
+            WHERE site = %s
+        ) latest ON b.createtime = latest.latest_createtime
+        WHERE b.site = %s
+          AND b.product_url IS NOT NULL
+          AND TRIM(b.product_url) <> ''
+        ORDER BY b.bsr_rank ASC, b.asin ASC
         LIMIT %s
     """
     return fetch_all(sql, (site, site, limit))

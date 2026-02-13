@@ -4,9 +4,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
+from .core.config import (
+    get_allowed_origins,
+    get_auth_secret_or_raise,
+    get_cors_allow_credentials,
+    validate_cors_settings,
+)
 from .core.handlers import http_exception_handler, unhandled_exception_handler, validation_exception_handler
 from .core.logging import request_logging_middleware
-from .routers import ai_insights, audit_logs, auth, bsr, dev, health, products, todo, users
+from .routers import ai_insights, audit_logs, auth, bsr, dev, health, products, strategy, users
+
+validate_cors_settings()
+get_auth_secret_or_raise()
 
 app = FastAPI(title="Bi-Amazon API", version="0.1.0")
 
@@ -16,8 +25,8 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=get_allowed_origins(),
+    allow_credentials=get_cors_allow_credentials(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -32,4 +41,4 @@ app.include_router(audit_logs.router)
 app.include_router(bsr.router)
 app.include_router(ai_insights.router)
 app.include_router(products.router)
-app.include_router(todo.router)
+app.include_router(strategy.router)

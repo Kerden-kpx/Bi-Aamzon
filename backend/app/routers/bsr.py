@@ -103,7 +103,7 @@ def get_bsr_dates(
 
 
 @router.post("/api/bsr/import")
-async def import_bsr_files(
+def import_bsr_files(
     seller_file: Optional[UploadFile] = File(None),
     seller_file_detail: Optional[UploadFile] = File(None),
     jimu_file: Optional[UploadFile] = File(None),
@@ -111,7 +111,7 @@ async def import_bsr_files(
     site: str = Form("US"),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    result = await bsr_service.import_bsr_files(
+    result = bsr_service.import_bsr_files(
         seller_file,
         seller_file_detail,
         jimu_file,
