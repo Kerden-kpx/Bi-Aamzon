@@ -7,14 +7,25 @@ import {
   CornersOut,
   MagnifyingGlass,
 } from "@phosphor-icons/react";
+import { Cascader } from "antd";
 import * as echarts from "echarts";
 import { useEffect, useMemo, useState, useRef } from "react";
+import { createPortal } from "react-dom";
 
 import { AppDatePicker } from "../components/AppDatePicker";
 import { FormInput, FormSelect } from "../components/FormControls";
+import {
+  fetchCategoryTreeOptions,
+  fetchCategoryRows,
+  invalidateCategoryCache,
+  findCategoryPathByLeaf,
+  getCategoryLeafFromPath,
+  type ProductCategoryRow,
+} from "../constants/productCategories";
 
-const permissionTabs = ["统计", "成员", "操作日志"];
-const bsrSiteOptions = ["US", "CA", "UK", "DE"];
+const permissionTabs = ["统计", "成员", "组", "操作日志"];
+const bsrSiteOptions = ["US", "CA", "UK", "DE", "JP"];
+const DEFAULT_PERMISSION_SITE = "US";
 
 type UserRow = {
   dingtalk_userid: string;
@@ -37,10 +48,24 @@ type AuditLogRow = {
   created_at: string;
 };
 
+type TeamMemberRow = {
+  userid: string;
+  username: string;
+  member_role: string;
+  status: string;
+};
+
+type TeamGroupRow = {
+  team_name: string;
+  member_count: number;
+  members: TeamMemberRow[];
+};
+
 type ProductOption = {
   asin: string;
   name: string;
   brand?: string;
+  category?: string;
   site?: string;
   imageUrl?: string;
 };
@@ -95,9 +120,11 @@ type ProductQueryRow = {
   product?: string;
   name?: string;
   brand?: string;
+  category?: string;
   bsr?: {
     site?: string;
     brand?: string;
+    category?: string;
     image_url?: string;
   };
 };
@@ -109,6 +136,7 @@ type DingTalkLookupResponseItem = {
 
 const roleLabel = (role: string) => {
   if (role === "admin") return "管理员";
+  if (role === "team_lead") return "运营组长";
   if (role === "operator") return "运营人员";
   return role || "-";
 };
@@ -121,7 +149,7 @@ const statusLabel = (status: string) => {
 
 const moduleLabel = (module: string) => {
   if (module === "strategy") return "策略";
-  if (module === "bsr") return "BSR";
+  if (module === "bsr") return "Best Sellers";
   if (module === "product") return "产品";
   if (module === "user") return "用户";
   if (module === "permission") return "权限";
@@ -153,13 +181,48 @@ const formatDateTime = (value?: string | null) => {
   return dotIndex >= 0 ? text.slice(0, dotIndex) : text;
 };
 
+const normalizeSite = (value: unknown) => {
+  const site = String(value || "").trim().toUpperCase();
+  return site || DEFAULT_PERMISSION_SITE;
+};
+
+const buildPermissionKey = (asin: string, site: string) =>
+  `${String(asin || "").trim().toUpperCase()}|${normalizeSite(site)}`;
+
+const splitPermissionKey = (value: string): { asin: string; site: string } => {
+  const parts = String(value || "").split("|");
+  const asin = String(parts[0] || "").trim().toUpperCase();
+  const site = normalizeSite(parts[1] || DEFAULT_PERMISSION_SITE);
+  return { asin, site };
+};
+
+const normalizeCategoryToLeaf = (value: unknown): string => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (findCategoryPathByLeaf(raw)) return raw;
+  const normalized = raw.replace(/＞/g, ">");
+  const parts = normalized.split(/>|\/|\\/).map((item) => item.trim()).filter(Boolean);
+  if (parts.length === 0) return raw;
+  return parts[parts.length - 1] || raw;
+};
+
 export function PermissionBoard({
   collapsed = false,
   onToggleCollapse,
+  currentRole = "operator",
 }: {
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  currentRole?: string;
 }) {
+  const normalizedRole = String(currentRole || "").trim().toLowerCase();
+  const canViewAdminTabs = normalizedRole === "admin";
+  const canViewTeamTabs = normalizedRole === "team_lead";
+  const visibleTabs = canViewAdminTabs ? permissionTabs : canViewTeamTabs ? ["成员"] : ["成员"];
+  const [categoryTreeOptions, setCategoryTreeOptions] = useState<object[]>([]);
+  useEffect(() => {
+    fetchCategoryTreeOptions().then(setCategoryTreeOptions);
+  }, []);
   const [activeTab, setActiveTab] = useState("成员");
   const [users, setUsers] = useState<UserRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -171,7 +234,7 @@ export function PermissionBoard({
   const [nameLookupLoading, setNameLookupLoading] = useState(false);
   const [nameLookupHint, setNameLookupHint] = useState<string | null>(null);
   const [nameLookupError, setNameLookupError] = useState<string | null>(null);
-  const [newUserRole, setNewUserRole] = useState<"admin" | "operator">("operator");
+  const [newUserRole, setNewUserRole] = useState<"admin" | "team_lead" | "operator">("operator");
   const [newUserStatus, setNewUserStatus] = useState<"active" | "disabled">("active");
   const [newUserScope, setNewUserScope] = useState<"all" | "restricted">("restricted");
   const [newPermissionSearch, setNewPermissionSearch] = useState("");
@@ -187,13 +250,20 @@ export function PermissionBoard({
   const [showEditModal, setShowEditModal] = useState(false);
   const [editUserId, setEditUserId] = useState("");
   const [editUserName, setEditUserName] = useState("");
-  const [editRole, setEditRole] = useState<"admin" | "operator">("operator");
+  const [editRole, setEditRole] = useState<"admin" | "team_lead" | "operator">("operator");
   const [editStatus, setEditStatus] = useState<"active" | "disabled">("active");
   const [editScope, setEditScope] = useState<"all" | "restricted">("all");
   const [permissionSearch, setPermissionSearch] = useState("");
   const [permissionSites, setPermissionSites] = useState<string[]>([...bsrSiteOptions]);
   const [editSiteDropdownOpen, setEditSiteDropdownOpen] = useState(false);
   const editSiteDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [editCategoryDropdownOpen, setEditCategoryDropdownOpen] = useState(false);
+  const editCategoryDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [editBrandDropdownOpen, setEditBrandDropdownOpen] = useState(false);
+  const editBrandDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [editCategoryPath, setEditCategoryPath] = useState<string[]>([]);
+  const [editCategoryFilters, setEditCategoryFilters] = useState<string[]>([]);
+  const [editBrandFilters, setEditBrandFilters] = useState<string[]>([]);
   const [editSelectedAsins, setEditSelectedAsins] = useState<string[]>([]);
   const [productOptions, setProductOptions] = useState<ProductOption[]>([]);
   const [productOptionsLoading, setProductOptionsLoading] = useState(false);
@@ -223,6 +293,29 @@ export function PermissionBoard({
   const [monthlyTrend, setMonthlyTrend] = useState<TrendRow[]>([]);
   const [moduleUsage, setModuleUsage] = useState<ModuleUsageRow[]>([]);
   const [usageRows, setUsageRows] = useState<UsageRow[]>([]);
+  const [teamGroups, setTeamGroups] = useState<TeamGroupRow[]>([]);
+  const [teamGroupsLoading, setTeamGroupsLoading] = useState(false);
+  const [teamGroupsError, setTeamGroupsError] = useState<string | null>(null);
+  const [groupSearch, setGroupSearch] = useState("");
+  const [showAddGroup, setShowAddGroup] = useState(false);
+  const [groupModalMode, setGroupModalMode] = useState<"create" | "edit">("create");
+  const [editingTeamName, setEditingTeamName] = useState("");
+  const [newGroupCode, setNewGroupCode] = useState("");
+  const [newGroupLeadUserId, setNewGroupLeadUserId] = useState("");
+  const [newGroupMemberUserIds, setNewGroupMemberUserIds] = useState<string[]>([]);
+  const [newGroupMemberDropdownOpen, setNewGroupMemberDropdownOpen] = useState(false);
+  const newGroupMemberTriggerRef = useRef<HTMLDivElement | null>(null);
+  const newGroupMemberDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [newGroupMemberDropdownPos, setNewGroupMemberDropdownPos] = useState({
+    left: 0,
+    top: 0,
+    width: 0,
+  });
+  const [newGroupSubmitting, setNewGroupSubmitting] = useState(false);
+  const [newGroupError, setNewGroupError] = useState<string | null>(null);
+  const [groupDeleteTarget, setGroupDeleteTarget] = useState<string | null>(null);
+  const [groupDeleteSubmitting, setGroupDeleteSubmitting] = useState(false);
+  const [groupDeleteError, setGroupDeleteError] = useState<string | null>(null);
   const [imagePreview, setImagePreview] = useState<{
     src: string;
     asin: string;
@@ -381,6 +474,39 @@ export function PermissionBoard({
     }
   };
 
+  const fetchTeamGroups = async () => {
+    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+    setTeamGroupsLoading(true);
+    setTeamGroupsError(null);
+    try {
+      const res = await fetch(`${apiBase}/api/teams`);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const items = Array.isArray(data?.items) ? data.items : [];
+      setTeamGroups(
+        items.map((item: any) => ({
+          team_name: String(item?.team_name || ""),
+          member_count: Number(item?.member_count || 0),
+          members: Array.isArray(item?.members)
+            ? item.members.map((member: any) => ({
+              userid: String(member?.userid || ""),
+              username: String(member?.username || ""),
+              member_role: String(member?.member_role || ""),
+              status: String(member?.status || ""),
+            }))
+            : [],
+        }))
+      );
+    } catch (err) {
+      setTeamGroupsError("加载组信息失败，请检查后端服务。");
+      setTeamGroups([]);
+    } finally {
+      setTeamGroupsLoading(false);
+    }
+  };
+
   const resetAuditFilters = () => {
     setLogModule("");
     setLogAction("");
@@ -389,6 +515,11 @@ export function PermissionBoard({
     setLogDateFrom("");
     setLogDateTo("");
   };
+
+  useEffect(() => {
+    if (visibleTabs.includes(activeTab)) return;
+    setActiveTab("成员");
+  }, [activeTab, visibleTabs]);
 
   useEffect(() => {
     fetchUsers();
@@ -404,23 +535,78 @@ export function PermissionBoard({
     fetchPermissionStats();
   }, [activeTab]);
 
+  useEffect(() => {
+    if (activeTab !== "组") return;
+    fetchTeamGroups();
+  }, [activeTab]);
+
   const filteredUsers = useMemo(() => {
     const keyword = search.trim().toLowerCase();
-    return users.filter((item) => {
+    const visibleUsers = canViewAdminTabs ? users : users.filter((item) => item.role !== "admin");
+    return visibleUsers.filter((item) => {
       return (
         !keyword ||
         item.dingtalk_username.toLowerCase().includes(keyword) ||
         item.dingtalk_userid.toLowerCase().includes(keyword)
       );
     });
-  }, [users, search]);
+  }, [users, search, canViewAdminTabs]);
+  const filteredTeamGroups = useMemo(() => {
+    const keyword = groupSearch.trim().toLowerCase();
+    if (!keyword) return teamGroups;
+    return teamGroups.filter((group) => String(group.team_name || "").toLowerCase().includes(keyword));
+  }, [teamGroups, groupSearch]);
+  const groupLeadOptions = useMemo(() => {
+    return users
+      .filter((user) => user.status === "active" && user.role === "team_lead")
+      .map((user) => ({
+        userid: user.dingtalk_userid,
+        username: user.dingtalk_username || user.dingtalk_userid,
+      }))
+      .sort((a, b) => a.username.localeCompare(b.username));
+  }, [users]);
+  const groupMemberOptions = useMemo(() => {
+    return users
+      .filter((user) => user.status === "active")
+      .map((user) => ({
+        userid: user.dingtalk_userid,
+        username: user.dingtalk_username || user.dingtalk_userid,
+      }))
+      .sort((a, b) => a.username.localeCompare(b.username));
+  }, [users]);
+  const allGroupMembersSelected = groupMemberOptions.length > 0 && newGroupMemberUserIds.length === groupMemberOptions.length;
+  const newGroupMembersLabel = useMemo(() => {
+    if (allGroupMembersSelected) return "全部成员";
+    if (newGroupMemberUserIds.length === 0) return "";
+    const names = newGroupMemberUserIds
+      .map((userid) => groupMemberOptions.find((item) => item.userid === userid)?.username || "")
+      .filter(Boolean);
+    if (names.length === 0) return "";
+    if (names.length <= 2) return names.join("、");
+    return `${names[0]}、${names[1]} 等${names.length}人`;
+  }, [allGroupMembersSelected, newGroupMemberUserIds, groupMemberOptions]);
+  const groupMembersMap = useMemo(() => {
+    const map = new Map<string, TeamMemberRow[]>();
+    teamGroups.forEach((group) => {
+      map.set(
+        group.team_name,
+        [...group.members].sort((a, b) => {
+          if (a.member_role === b.member_role) {
+            return String(a.username || "").localeCompare(String(b.username || ""));
+          }
+          return a.member_role === "lead" ? -1 : 1;
+        })
+      );
+    });
+    return map;
+  }, [teamGroups]);
 
   const stats = useMemo(() => {
     const total = users.length;
     const adminCount = users.filter((u) => u.role === "admin").length;
+    const teamLeadCount = users.filter((u) => u.role === "team_lead").length;
     const operatorCount = users.filter((u) => u.role === "operator").length;
-    const disabledCount = users.filter((u) => u.status === "disabled").length;
-    return { total, adminCount, operatorCount, disabledCount };
+    return { total, adminCount, teamLeadCount, operatorCount };
   }, [users]);
 
   useEffect(() => {
@@ -506,40 +692,77 @@ export function PermissionBoard({
   const visibilityOptions = useMemo(() => {
     const map = new Map<string, ProductOption>();
     productOptions.forEach((item) => {
-      map.set(item.asin, item);
+      map.set(buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE), item);
     });
-    editSelectedAsins.forEach((asin) => {
-      const normalized = String(asin || "").toUpperCase();
-      if (!normalized) return;
-      if (!map.has(normalized)) {
-        map.set(normalized, { asin: normalized, name: "" });
+    editSelectedAsins.forEach((token) => {
+      const { asin, site } = splitPermissionKey(token);
+      if (!asin) return;
+      const key = buildPermissionKey(asin, site);
+      if (!map.has(key)) {
+        map.set(key, { asin, site, name: "" });
       }
     });
-    return Array.from(map.values());
+    return Array.from(map.values()).sort((a, b) => {
+      const brandA = String(a.brand || "").trim();
+      const brandB = String(b.brand || "").trim();
+      const brandCompare = brandA.localeCompare(brandB, undefined, { sensitivity: "base" });
+      if (brandCompare !== 0) return brandCompare;
+      const asinCompare = String(a.asin || "").localeCompare(String(b.asin || ""), undefined, { sensitivity: "base" });
+      if (asinCompare !== 0) return asinCompare;
+      return String(a.site || DEFAULT_PERMISSION_SITE).localeCompare(
+        String(b.site || DEFAULT_PERMISSION_SITE),
+        undefined,
+        { sensitivity: "base" }
+      );
+    });
   }, [productOptions, editSelectedAsins]);
   const addVisibilityOptions = useMemo(() => {
     const map = new Map<string, ProductOption>();
     productOptions.forEach((item) => {
-      map.set(item.asin, item);
+      map.set(buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE), item);
     });
-    newUserSelectedAsins.forEach((asin) => {
-      const normalized = String(asin || "").toUpperCase();
-      if (!normalized) return;
-      if (!map.has(normalized)) {
-        map.set(normalized, { asin: normalized, name: "" });
+    newUserSelectedAsins.forEach((token) => {
+      const { asin, site } = splitPermissionKey(token);
+      if (!asin) return;
+      const key = buildPermissionKey(asin, site);
+      if (!map.has(key)) {
+        map.set(key, { asin, site, name: "" });
       }
     });
-    return Array.from(map.values());
+    return Array.from(map.values()).sort((a, b) => {
+      const brandA = String(a.brand || "").trim();
+      const brandB = String(b.brand || "").trim();
+      const brandCompare = brandA.localeCompare(brandB, undefined, { sensitivity: "base" });
+      if (brandCompare !== 0) return brandCompare;
+      const asinCompare = String(a.asin || "").localeCompare(String(b.asin || ""), undefined, { sensitivity: "base" });
+      if (asinCompare !== 0) return asinCompare;
+      return String(a.site || DEFAULT_PERMISSION_SITE).localeCompare(
+        String(b.site || DEFAULT_PERMISSION_SITE),
+        undefined,
+        { sensitivity: "base" }
+      );
+    });
   }, [productOptions, newUserSelectedAsins]);
   const filteredVisibilityOptions = useMemo(() => {
     const keyword = permissionSearch.trim().toLowerCase();
-    if (!keyword) return visibilityOptions;
+    const selectedCategories = new Set(editCategoryFilters);
+    const selectedBrands = new Set(editBrandFilters);
     return visibilityOptions.filter((item) => {
       const asin = String(item.asin || "").toLowerCase();
       const name = String(item.name || "").toLowerCase();
-      return asin.includes(keyword) || name.includes(keyword);
+      const category = normalizeCategoryToLeaf(item.category);
+      const brand = String(item.brand || "").trim();
+      const matchesKeyword = !keyword || asin.includes(keyword) || name.includes(keyword);
+      const matchesCategory = selectedCategories.size === 0 || selectedCategories.has(category);
+      const matchesBrand = selectedBrands.size === 0 || selectedBrands.has(brand);
+      return matchesKeyword && matchesCategory && matchesBrand;
     });
-  }, [visibilityOptions, permissionSearch]);
+  }, [visibilityOptions, permissionSearch, editCategoryFilters, editBrandFilters]);
+  const filteredVisibilityKeys = useMemo(() => {
+    return filteredVisibilityOptions.map((item) =>
+      buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE)
+    );
+  }, [filteredVisibilityOptions]);
   const filteredAddVisibilityOptions = useMemo(() => {
     const keyword = newPermissionSearch.trim().toLowerCase();
     if (!keyword) return addVisibilityOptions;
@@ -551,6 +774,7 @@ export function PermissionBoard({
   }, [addVisibilityOptions, newPermissionSearch]);
 
   const isMemberTab = activeTab === "成员";
+  const isGroupTab = activeTab === "组";
   const isStatsTab = activeTab === "统计";
   const isLogTab = activeTab === "操作日志";
   const monthlyTrendMax = Math.max(1, ...monthlyTrend.map((row) => row.count));
@@ -558,8 +782,26 @@ export function PermissionBoard({
   const fieldLabelClass = "text-sm font-semibold text-[#3D4757] mb-2";
   const staticFieldClass =
     "h-11 rounded-xl border border-[#E9EDF3] bg-[#F4F6FA] px-4 flex items-center text-[#5D6778] font-semibold";
-  const permissionEditable = editRole === "operator";
-  const newPermissionEditable = newUserRole === "operator";
+  const permissionEditable = editRole === "operator" || editRole === "team_lead";
+  const newPermissionEditable = newUserRole === "operator" || newUserRole === "team_lead";
+  const editCategoryOptions = useMemo(() => {
+    return Array.from(
+      new Set(
+        visibilityOptions
+          .map((item) => normalizeCategoryToLeaf(item.category))
+          .filter((item) => item.length > 0)
+      )
+    ).sort((a, b) => a.localeCompare(b));
+  }, [visibilityOptions]);
+  const editBrandOptions = useMemo(() => {
+    return Array.from(
+      new Set(
+        visibilityOptions
+          .map((item) => String(item.brand || "").trim())
+          .filter((item) => item.length > 0)
+      )
+    ).sort((a, b) => a.localeCompare(b));
+  }, [visibilityOptions]);
 
   const loadProductVisibility = async (userid: string) => {
     if (!userid) return;
@@ -574,9 +816,19 @@ export function PermissionBoard({
       const data = await res.json();
       const item = data?.item || {};
       const scope = item?.product_scope === "restricted" ? "restricted" : "all";
-      const asins = Array.isArray(item?.asins) ? item.asins : [];
+      const permissions = Array.isArray(item?.permissions)
+        ? item.permissions
+          .map((entry: any) => buildPermissionKey(entry?.asin, entry?.site))
+          .filter(Boolean)
+        : [];
+      const asins = permissions.length > 0
+        ? permissions
+        : (Array.isArray(item?.asins) ? item.asins : []).map((token: string) => {
+          const { asin, site } = splitPermissionKey(token);
+          return buildPermissionKey(asin, site);
+        });
       setEditScope(scope);
-      setEditSelectedAsins(asins.map((asin: string) => String(asin).toUpperCase()));
+      setEditSelectedAsins(asins);
     } catch (err) {
       setEditError("加载产品权限失败，请检查后端服务。");
       setEditScope("all");
@@ -610,10 +862,7 @@ export function PermissionBoard({
           })
         )
       );
-      const dedup = new Map<
-        string,
-        ProductOption & { siteSet: Set<string> }
-      >();
+      const dedup = new Map<string, ProductOption>();
       let hasError = false;
 
       for (let index = 0; index < results.length; index += 1) {
@@ -633,42 +882,38 @@ export function PermissionBoard({
         items.forEach((item) => {
           const asin = String(item?.asin || "").toUpperCase().trim();
           if (!asin) return;
-          const site = String(item?.site || item?.bsr?.site || fallbackSite || "US").toUpperCase().trim();
+          const site = normalizeSite(item?.site || item?.bsr?.site || fallbackSite || DEFAULT_PERMISSION_SITE);
           const name = String(item?.product || item?.name || "").trim();
           const brand = String(item?.brand || item?.bsr?.brand || "").trim();
+          const category = String(item?.category || item?.bsr?.category || "").trim();
           const imageUrl = item?.bsr?.image_url || "";
+          const key = buildPermissionKey(asin, site);
 
-          const existing = dedup.get(asin);
+          const existing = dedup.get(key);
           if (!existing) {
-            dedup.set(asin, {
+            dedup.set(key, {
               asin,
               name,
               brand,
+              category,
               imageUrl,
               site,
-              siteSet: new Set([site]),
             });
             return;
           }
-          existing.siteSet.add(site);
           if (!existing.name && name) existing.name = name;
           if (!existing.brand && brand) existing.brand = brand;
+          if (!existing.category && category) existing.category = category;
           if (!existing.imageUrl && imageUrl) existing.imageUrl = imageUrl;
         });
       }
 
       const mapped = Array.from(dedup.values())
-        .map((item) => {
-          const siteList = Array.from(item.siteSet).sort();
-          return {
-            asin: item.asin,
-            name: item.name,
-            brand: item.brand,
-            imageUrl: item.imageUrl,
-            site: siteList.join(","),
-          };
-        })
-        .sort((a, b) => a.asin.localeCompare(b.asin));
+        .sort((a, b) => {
+          const siteCompare = String(a.site || "").localeCompare(String(b.site || ""));
+          if (siteCompare !== 0) return siteCompare;
+          return a.asin.localeCompare(b.asin);
+        });
 
       setProductOptions(mapped);
       if (hasError) {
@@ -691,16 +936,21 @@ export function PermissionBoard({
     setShowEditModal(true);
     setEditUserId(user.dingtalk_userid);
     setEditUserName(user.dingtalk_username);
-    setEditRole(user.role === "admin" ? "admin" : "operator");
+    setEditRole(user.role === "admin" ? "admin" : user.role === "team_lead" ? "team_lead" : "operator");
     setEditStatus(user.status === "disabled" ? "disabled" : "active");
     setEditScope(user.product_scope === "restricted" ? "restricted" : "all");
     setPermissionSearch("");
     setPermissionSites(defaultSites);
     setEditSiteDropdownOpen(false);
+    setEditCategoryDropdownOpen(false);
+    setEditBrandDropdownOpen(false);
+    setEditCategoryPath([]);
+    setEditCategoryFilters([]);
+    setEditBrandFilters([]);
     setEditSelectedAsins([]);
     setEditError(null);
 
-    if (user.role === "operator") {
+    if (user.role === "operator" || user.role === "team_lead") {
       await Promise.all([
         loadProductOptions(defaultSites, setEditError),
         loadProductVisibility(user.dingtalk_userid),
@@ -746,6 +996,11 @@ export function PermissionBoard({
     setPermissionSearch("");
     setEditError(null);
     setEditSiteDropdownOpen(false);
+    setEditCategoryDropdownOpen(false);
+    setEditBrandDropdownOpen(false);
+    setEditCategoryPath([]);
+    setEditCategoryFilters([]);
+    setEditBrandFilters([]);
   };
 
   useEffect(() => {
@@ -759,10 +1014,17 @@ export function PermissionBoard({
   }, [showAddUser, newPermissionSites]);
 
   useEffect(() => {
+    if (!showAddGroup) return;
+    loadProductOptions([...bsrSiteOptions], setNewGroupError);
+  }, [showAddGroup]);
+
+  useEffect(() => {
     if (!showEditModal) return;
     if (editScope !== "all") return;
     if (productOptions.length === 0) return;
-    const allAsins = productOptions.map((item) => item.asin);
+    const allAsins = productOptions.map((item) =>
+      buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE)
+    );
     setEditSelectedAsins((prev) => {
       if (
         prev.length === allAsins.length &&
@@ -778,7 +1040,9 @@ export function PermissionBoard({
     if (!showAddUser) return;
     if (newUserScope !== "all") return;
     if (productOptions.length === 0) return;
-    const allAsins = productOptions.map((item) => item.asin);
+    const allAsins = productOptions.map((item) =>
+      buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE)
+    );
     setNewUserSelectedAsins((prev) => {
       if (
         prev.length === allAsins.length &&
@@ -792,18 +1056,23 @@ export function PermissionBoard({
 
   useEffect(() => {
     if (!showEditModal) return;
-    if (editRole === "operator") return;
+    if (editRole === "operator" || editRole === "team_lead") return;
     setEditScope("all");
   }, [showEditModal, editRole]);
 
   useEffect(() => {
     if (!showAddUser) return;
-    if (newUserRole === "operator") return;
+    if (newUserRole === "operator" || newUserRole === "team_lead") return;
     setNewUserScope("all");
   }, [showAddUser, newUserRole]);
 
   useEffect(() => {
-    const hasModal = showEditModal || showAddUser || deleteTarget !== null;
+    const hasModal =
+      showEditModal ||
+      showAddUser ||
+      showAddGroup ||
+      deleteTarget !== null ||
+      groupDeleteTarget !== null;
     if (!hasModal) return;
     const previousBodyOverflow = document.body.style.overflow;
     const previousHtmlOverflow = document.documentElement.style.overflow;
@@ -813,13 +1082,34 @@ export function PermissionBoard({
       document.body.style.overflow = previousBodyOverflow;
       document.documentElement.style.overflow = previousHtmlOverflow;
     };
-  }, [showEditModal, showAddUser, deleteTarget]);
+  }, [showEditModal, showAddUser, showAddGroup, deleteTarget, groupDeleteTarget]);
 
   useEffect(() => {
-    if (!showEditModal && !showAddUser) {
+    if (!showEditModal && !showAddUser && !showAddGroup) {
       setImagePreview(null);
     }
-  }, [showEditModal, showAddUser]);
+  }, [showEditModal, showAddUser, showAddGroup]);
+
+  useEffect(() => {
+    if (!newGroupMemberDropdownOpen) return;
+    const updateDropdownPosition = () => {
+      const trigger = newGroupMemberTriggerRef.current;
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const width = Math.max(220, rect.width);
+      const maxLeft = Math.max(8, window.innerWidth - width - 8);
+      const left = Math.min(Math.max(8, rect.left), maxLeft);
+      const top = rect.bottom + 6;
+      setNewGroupMemberDropdownPos({ left, top, width });
+    };
+    updateDropdownPosition();
+    window.addEventListener("resize", updateDropdownPosition);
+    window.addEventListener("scroll", updateDropdownPosition, true);
+    return () => {
+      window.removeEventListener("resize", updateDropdownPosition);
+      window.removeEventListener("scroll", updateDropdownPosition, true);
+    };
+  }, [newGroupMemberDropdownOpen]);
 
   useEffect(() => {
     const onMouseDown = (event: MouseEvent) => {
@@ -835,12 +1125,37 @@ export function PermissionBoard({
       ) {
         setEditSiteDropdownOpen(false);
       }
+      if (
+        editCategoryDropdownRef.current &&
+        !editCategoryDropdownRef.current.contains(event.target as Node)
+      ) {
+        setEditCategoryDropdownOpen(false);
+      }
+      if (
+        editBrandDropdownRef.current &&
+        !editBrandDropdownRef.current.contains(event.target as Node)
+      ) {
+        setEditBrandDropdownOpen(false);
+      }
+      if (
+        newGroupMemberTriggerRef.current &&
+        !newGroupMemberTriggerRef.current.contains(event.target as Node) &&
+        !newGroupMemberDropdownRef.current?.contains(event.target as Node)
+      ) {
+        setNewGroupMemberDropdownOpen(false);
+      }
     };
     document.addEventListener("mousedown", onMouseDown);
     return () => {
       document.removeEventListener("mousedown", onMouseDown);
     };
   }, []);
+
+  useEffect(() => {
+    setEditBrandFilters((prev) =>
+      prev.filter((item) => editBrandOptions.includes(item))
+    );
+  }, [editBrandOptions]);
 
   const saveEditModal = async () => {
     if (!editUserId) {
@@ -861,18 +1176,23 @@ export function PermissionBoard({
       }
 
       let scopeForList: "all" | "restricted" = "all";
-      if (editRole === "operator") {
+      if (editRole === "operator" || editRole === "team_lead") {
         const normalizedAsins = Array.from(
           new Set(
             editSelectedAsins
-              .map((item) => String(item || "").toUpperCase().trim())
+              .map((item) => {
+                const { asin, site } = splitPermissionKey(String(item || ""));
+                return buildPermissionKey(asin, site);
+              })
               .filter(Boolean)
           )
         );
         const totalOptions = productOptions.length;
         const selectedAll =
           totalOptions > 0 &&
-          productOptions.every((item) => normalizedAsins.includes(item.asin));
+          productOptions.every((item) =>
+            normalizedAsins.includes(buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE))
+          );
         const scope: "all" | "restricted" =
           selectedAll || (totalOptions === 0 && editScope === "all")
             ? "all"
@@ -966,19 +1286,25 @@ export function PermissionBoard({
         throw new Error(`HTTP ${res.status}`);
       }
 
-      let scopeForList: "all" | "restricted" = newUserRole === "operator" ? "restricted" : "all";
-      if (newUserRole === "operator") {
+      let scopeForList: "all" | "restricted" =
+        newUserRole === "operator" || newUserRole === "team_lead" ? "restricted" : "all";
+      if (newUserRole === "operator" || newUserRole === "team_lead") {
         const normalizedAsins = Array.from(
           new Set(
             newUserSelectedAsins
-              .map((item) => String(item || "").toUpperCase().trim())
+              .map((item) => {
+                const { asin, site } = splitPermissionKey(String(item || ""));
+                return buildPermissionKey(asin, site);
+              })
               .filter(Boolean)
           )
         );
         const totalOptions = productOptions.length;
         const selectedAll =
           totalOptions > 0 &&
-          productOptions.every((item) => normalizedAsins.includes(item.asin));
+          productOptions.every((item) =>
+            normalizedAsins.includes(buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE))
+          );
         const scope: "all" | "restricted" =
           selectedAll || (totalOptions === 0 && newUserScope === "all")
             ? "all"
@@ -1086,6 +1412,10 @@ export function PermissionBoard({
   const editSitesLabel = allEditSitesSelected
     ? "全部站点"
     : normalizeSiteList(permissionSites).join(",");
+  const editBrandLabel =
+    editBrandFilters.length === 0
+      ? "全部品牌"
+      : editBrandFilters.join(",");
 
   const toggleNewSite = (site: string) => {
     setNewPermissionSites((prev) => {
@@ -1107,6 +1437,155 @@ export function PermissionBoard({
       }
       return [...normalized, site];
     });
+  };
+
+  const toggleEditBrand = (brand: string) => {
+    setEditBrandFilters((prev) => {
+      if (prev.includes(brand)) {
+        return prev.filter((item) => item !== brand);
+      }
+      return [...prev, brand];
+    });
+  };
+
+  const openAddGroupModal = () => {
+    setGroupModalMode("create");
+    setEditingTeamName("");
+    setShowAddGroup(true);
+    setNewGroupCode("");
+    setNewGroupLeadUserId("");
+    setNewGroupMemberUserIds([]);
+    setNewGroupMemberDropdownOpen(false);
+    setNewGroupError(null);
+  };
+
+  const openEditGroupModal = (group: TeamGroupRow) => {
+    const members = Array.isArray(group.members) ? group.members : [];
+    const leadMember = members.find((member) => member.member_role === "lead");
+    setGroupModalMode("edit");
+    setEditingTeamName(group.team_name);
+    setShowAddGroup(true);
+    setNewGroupCode(group.team_name);
+    setNewGroupLeadUserId(leadMember?.userid || "");
+    setNewGroupMemberUserIds(
+      Array.from(
+        new Set(
+          members
+            .map((member) => String(member.userid || "").trim())
+            .filter(Boolean)
+        )
+      )
+    );
+    setNewGroupMemberDropdownOpen(false);
+    setNewGroupError(null);
+  };
+
+  const closeAddGroupModal = () => {
+    if (newGroupSubmitting) return;
+    setShowAddGroup(false);
+    setGroupModalMode("create");
+    setEditingTeamName("");
+    setNewGroupMemberDropdownOpen(false);
+    setNewGroupError(null);
+  };
+
+  const toggleNewGroupMember = (userid: string) => {
+    setNewGroupMemberUserIds((prev) => {
+      if (prev.includes(userid)) {
+        return prev.filter((item) => item !== userid);
+      }
+      return [...prev, userid];
+    });
+  };
+
+  const submitAddGroup = async () => {
+    const teamCode = newGroupCode.trim();
+    const leadUserId = newGroupLeadUserId.trim();
+    if (!teamCode) {
+      setNewGroupError("组名不能为空。");
+      return;
+    }
+    if (!leadUserId) {
+      setNewGroupError("请选择组长。");
+      return;
+    }
+    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+    setNewGroupSubmitting(true);
+    setNewGroupError(null);
+    try {
+      const payloadMembers = Array.from(new Set([leadUserId, ...newGroupMemberUserIds]));
+      const isEditMode = groupModalMode === "edit";
+      const targetTeamName = isEditMode ? editingTeamName : teamCode;
+      const res = await fetch(
+        isEditMode
+          ? `${apiBase}/api/teams/${encodeURIComponent(targetTeamName)}`
+          : `${apiBase}/api/teams`,
+        {
+          method: isEditMode ? "PUT" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...(isEditMode ? { new_team_name: teamCode } : { team_name: teamCode }),
+            lead_userid: leadUserId,
+            member_userids: payloadMembers,
+          }),
+        }
+      );
+      if (!res.ok) {
+        let detail = "";
+        try {
+          const data = await res.json();
+          detail = String(data?.detail || "");
+        } catch {
+          // ignore
+        }
+        throw new Error(detail || `HTTP ${res.status}`);
+      }
+      setShowAddGroup(false);
+      setGroupModalMode("create");
+      setEditingTeamName("");
+      await fetchTeamGroups();
+    } catch (err) {
+      const fallback = groupModalMode === "edit" ? "修改组失败，请稍后重试。" : "新增组失败，请稍后重试。";
+      const message = err instanceof Error ? err.message : fallback;
+      setNewGroupError(message || fallback);
+    } finally {
+      setNewGroupSubmitting(false);
+    }
+  };
+
+  const requestDeleteGroup = (teamName: string) => {
+    const target = String(teamName || "").trim();
+    if (!target) return;
+    setGroupDeleteTarget(target);
+    setGroupDeleteError(null);
+  };
+
+  const closeDeleteGroupModal = () => {
+    if (groupDeleteSubmitting) return;
+    setGroupDeleteTarget(null);
+    setGroupDeleteError(null);
+  };
+
+  const confirmDeleteGroup = async () => {
+    if (!groupDeleteTarget) return;
+    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+    setGroupDeleteSubmitting(true);
+    setGroupDeleteError(null);
+    try {
+      const res = await fetch(`${apiBase}/api/teams/${encodeURIComponent(groupDeleteTarget)}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      setGroupDeleteTarget(null);
+      await fetchTeamGroups();
+    } catch (err) {
+      setGroupDeleteError("删除组失败，请检查后端服务。");
+    } finally {
+      setGroupDeleteSubmitting(false);
+    }
   };
 
   const confirmDeleteUser = async () => {
@@ -1162,7 +1641,7 @@ export function PermissionBoard({
       <div className="mb-8">
         <div className="flex items-center justify-between mb-6">
           <div className="flex gap-6 text-sm">
-            {permissionTabs.map((tab) => (
+            {visibleTabs.map((tab) => (
               <button
                 key={tab}
                 className={`pb-2 ${tab === activeTab
@@ -1177,6 +1656,7 @@ export function PermissionBoard({
           </div>
           <div className="flex items-center gap-3">
             {isMemberTab && null}
+            {isGroupTab && null}
             {isLogTab && (
               <button
                 className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg"
@@ -1195,8 +1675,8 @@ export function PermissionBoard({
           {[
             { label: "成员总数", value: String(stats.total), icon: <UsersThree size={18} />, tone: "bg-[#1C1C1E] text-white" },
             { label: "管理员", value: String(stats.adminCount), icon: <UsersThree size={18} />, tone: "bg-[#3B9DF8] text-white" },
-            { label: "运营人员", value: String(stats.operatorCount), icon: <CheckCircle size={18} />, tone: "bg-[#1C1C1E] text-white" },
-            { label: "已禁用", value: String(stats.disabledCount), icon: <UsersThree size={18} />, tone: "bg-[#3B9DF8] text-white" },
+            { label: "运营组长", value: String(stats.teamLeadCount), icon: <UsersThree size={18} />, tone: "bg-[#1C1C1E] text-white" },
+            { label: "运营人员", value: String(stats.operatorCount), icon: <CheckCircle size={18} />, tone: "bg-[#3B9DF8] text-white" },
           ].map((item) => (
             <div key={item.label} className={`p-6 rounded-3xl shadow-lg ${item.tone} card-hover-lift`}>
               <div className="flex justify-between items-start mb-4">
@@ -1279,7 +1759,7 @@ export function PermissionBoard({
                       <span className="px-2 py-1 rounded-full text-[10px] font-bold bg-blue-100 text-blue-600">
                         全部可见
                       </span>
-                    ) : item.role === "operator" ? (
+                    ) : item.role === "operator" || item.role === "team_lead" ? (
                       <span
                         className={`px-2 py-1 rounded-full text-[10px] font-bold ${item.product_scope === "restricted"
                           ? "bg-amber-100 text-amber-700"
@@ -1305,6 +1785,109 @@ export function PermissionBoard({
                   </td>
                 </tr>
               ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {isGroupTab && (
+        <section className="bg-white p-5 rounded-3xl shadow-sm mb-6">
+          <div className="flex items-center justify-between mb-6">
+            <h3 className="text-lg font-bold text-gray-900">组列表</h3>
+            <div className="flex items-center gap-2">
+              <div className="relative w-[300px]">
+                <MagnifyingGlass
+                  size={14}
+                  className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
+                />
+                <FormInput
+                  size="sm"
+                  value={groupSearch}
+                  onChange={(e) => setGroupSearch(e.target.value)}
+                  placeholder="搜索组名"
+                  className="pl-9"
+                />
+              </div>
+              {canViewAdminTabs && (
+                <button
+                  className="h-[34px] min-w-[86px] px-2.5 rounded-lg bg-[#0C1731] hover:bg-[#162443] text-white text-xs font-semibold flex items-center justify-center whitespace-nowrap shrink-0 shadow-sm transition"
+                  onClick={openAddGroupModal}
+                >
+                  新增组
+                </button>
+              )}
+            </div>
+          </div>
+          {teamGroupsLoading && (
+            <div className="py-8 text-center text-xs text-gray-400">正在加载组信息...</div>
+          )}
+          {!teamGroupsLoading && teamGroupsError && (
+            <div className="py-8 text-center text-xs text-red-500">{teamGroupsError}</div>
+          )}
+          <table className="w-full text-sm text-center table-fixed">
+            <thead className="text-gray-400 font-normal text-xs">
+              <tr>
+                <th className="font-normal py-3 px-2 w-[180px] text-left">组名</th>
+                <th className="font-normal py-3 px-2 w-[160px] text-left">组长</th>
+                <th className="font-normal py-3 px-2 w-[120px] text-left">状态</th>
+                <th className="font-normal py-3 px-2 w-[120px] text-left">操作</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {!teamGroupsLoading && !teamGroupsError && filteredTeamGroups.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="py-8 text-center text-xs text-gray-400">
+                    暂无组数据
+                  </td>
+                </tr>
+              )}
+              {!teamGroupsLoading && !teamGroupsError &&
+                filteredTeamGroups.map((group) => {
+                  const members = groupMembersMap.get(group.team_name) || [];
+                  const leaderMember = members.find((member) => member.member_role === "lead");
+                  const leaderName = leaderMember?.username || "-";
+                  const leaderStatus = leaderMember?.status || "";
+                  return (
+                    <tr key={group.team_name} className="hover:bg-gray-50 transition align-top">
+                      <td className="py-4 px-2 text-sm text-gray-900 font-medium text-left">{group.team_name}</td>
+                      <td className="py-4 px-2 text-sm text-gray-700 text-left">{leaderName}</td>
+                      <td className="py-4 px-2 text-left">
+                        {leaderMember ? (
+                          <span
+                            className={`px-2 py-1 rounded-full text-[10px] font-bold ${leaderStatus === "active"
+                              ? "bg-green-100 text-green-600"
+                              : "bg-gray-100 text-gray-500"
+                              }`}
+                          >
+                            {leaderStatus === "active" ? "Active" : "Paused"}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-gray-400">-</span>
+                        )}
+                      </td>
+                      <td className="py-4 px-2 text-left">
+                        {canViewAdminTabs ? (
+                          <div className="flex items-center gap-3">
+                            <button
+                              className="text-xs text-blue-600 font-semibold"
+                              onClick={() => openEditGroupModal(group)}
+                            >
+                              编辑
+                            </button>
+                            <button
+                              className="text-xs text-red-500 font-semibold"
+                              onClick={() => requestDeleteGroup(group.team_name)}
+                            >
+                              删除
+                            </button>
+                          </div>
+                        ) : (
+                          <span className="text-xs text-gray-400">-</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
             </tbody>
           </table>
         </section>
@@ -1514,7 +2097,7 @@ export function PermissionBoard({
             >
               <option value="">全部模块</option>
               <option value="strategy">策略</option>
-              <option value="bsr">BSR</option>
+              <option value="bsr">Best Sellers</option>
               <option value="product">产品</option>
               <option value="user">用户</option>
               <option value="permission">权限</option>
@@ -1624,6 +2207,144 @@ export function PermissionBoard({
         </section>
       )}
 
+      {showAddGroup && (
+        <div className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center p-4">
+          <div className="bg-white rounded-[22px] shadow-[0_12px_40px_rgba(15,23,42,0.14)] w-full max-w-2xl p-5 md:p-6 max-h-[88vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-5">
+              <h3 className="text-lg font-bold text-gray-900">{groupModalMode === "edit" ? "编辑组" : "新增组"}</h3>
+              <button
+                className="text-[30px] leading-none text-[#C3CAD5] hover:text-[#7F8A9B]"
+                onClick={closeAddGroupModal}
+                disabled={newGroupSubmitting}
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-5">
+              <div>
+                <div className={fieldLabelClass}>组名</div>
+                <FormInput
+                  value={newGroupCode}
+                  onChange={(e) => setNewGroupCode(e.target.value)}
+                  placeholder={groupModalMode === "edit" ? "" : "例如：运营组A"}
+                  className="h-11 !rounded-xl border-[#E9EDF3] bg-[#F4F6FA] text-[#1F2937] font-semibold"
+                  disabled={newGroupSubmitting}
+                />
+              </div>
+              <div>
+                <div className={fieldLabelClass}>组长</div>
+                <FormSelect
+                  value={newGroupLeadUserId}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setNewGroupLeadUserId(value);
+                    if (value) {
+                      setNewGroupMemberUserIds((prev) => (prev.includes(value) ? prev : [...prev, value]));
+                    }
+                  }}
+                  className="h-11 !rounded-xl border-[#E9EDF3] bg-[#F4F6FA] text-[#1F2937] font-semibold"
+                  disabled={newGroupSubmitting}
+                >
+                  <option value="">请选择组长</option>
+                  {groupLeadOptions.map((item) => (
+                    <option key={item.userid} value={item.userid}>
+                      {item.username}
+                    </option>
+                  ))}
+                </FormSelect>
+              </div>
+            </div>
+
+            <div className="mb-5">
+              <div className={fieldLabelClass}>组成员</div>
+              <div className="relative w-full" ref={newGroupMemberTriggerRef}>
+                <button
+                  type="button"
+                  onClick={() => setNewGroupMemberDropdownOpen((prev) => !prev)}
+                  disabled={newGroupSubmitting}
+                  className="w-full h-11 px-3 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] disabled:opacity-60"
+                >
+                  <span className="truncate">{newGroupMembersLabel || "请选择组成员"}</span>
+                  <CaretDown
+                    size={14}
+                    className={`text-[#7A8596] transition-transform ${newGroupMemberDropdownOpen ? "rotate-180" : ""}`}
+                  />
+                </button>
+              </div>
+              <div className="mt-2 text-xs text-[#7A8596]">
+                已选 {newGroupMemberUserIds.length} 人
+              </div>
+            </div>
+
+            {newGroupError && (
+              <div className="mb-4 text-sm text-red-500">{newGroupError}</div>
+            )}
+
+            <div className="flex items-center justify-end gap-3 mt-5 border-t border-[#EEF1F5] pt-4">
+              <button
+                className="h-11 w-24 text-sm font-semibold text-[#6B7280] hover:bg-[#F5F7FA] rounded-lg transition"
+                onClick={closeAddGroupModal}
+                disabled={newGroupSubmitting}
+              >
+                取消
+              </button>
+              <button
+                className="h-11 w-24 text-sm font-semibold text-white bg-[#0C1731] hover:bg-[#081022] rounded-lg disabled:opacity-60 transition shadow-sm"
+                onClick={submitAddGroup}
+                disabled={newGroupSubmitting}
+              >
+                {newGroupSubmitting
+                  ? (groupModalMode === "edit" ? "保存中..." : "创建中...")
+                  : (groupModalMode === "edit" ? "保存" : "创建组")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showAddGroup && newGroupMemberDropdownOpen && createPortal(
+        <div
+          ref={newGroupMemberDropdownRef}
+          style={{
+            position: "fixed",
+            left: newGroupMemberDropdownPos.left,
+            top: newGroupMemberDropdownPos.top,
+            width: newGroupMemberDropdownPos.width,
+          }}
+          className="z-[70] rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2 max-h-64 overflow-y-auto"
+        >
+          <label className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer">
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-[#0C1731]"
+              checked={allGroupMembersSelected}
+              onChange={() =>
+                setNewGroupMemberUserIds(
+                  allGroupMembersSelected ? [] : groupMemberOptions.map((item) => item.userid)
+                )
+              }
+            />
+            全部成员
+          </label>
+          <div className="my-1 h-px bg-[#EEF2F7]" />
+          {groupMemberOptions.map((item) => (
+            <label
+              key={`group-member-${item.userid}`}
+              className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
+            >
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-[#0C1731]"
+                checked={newGroupMemberUserIds.includes(item.userid)}
+                onChange={() => toggleNewGroupMember(item.userid)}
+              />
+              {item.username}
+            </label>
+          ))}
+        </div>,
+        document.body
+      )}
+
       {showAddUser && (
         <div className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center p-4">
           <div className="bg-white rounded-[22px] shadow-[0_12px_40px_rgba(15,23,42,0.14)] w-full max-w-5xl p-6 md:p-8 max-h-[90vh] overflow-y-auto">
@@ -1678,11 +2399,12 @@ export function PermissionBoard({
                 <div className={fieldLabelClass}>角色</div>
                 <FormSelect
                   value={newUserRole}
-                  onChange={(e) => setNewUserRole(e.target.value as "admin" | "operator")}
+                  onChange={(e) => setNewUserRole(e.target.value as "admin" | "team_lead" | "operator")}
                   className="h-11 !rounded-xl border-[#E9EDF3] bg-[#F4F6FA] text-[#1F2937] font-semibold"
                   disabled={creating}
                 >
                   <option value="admin">管理员</option>
+                  <option value="team_lead">运营组长</option>
                   <option value="operator">运营人员</option>
                 </FormSelect>
               </div>
@@ -1712,7 +2434,13 @@ export function PermissionBoard({
                     <button
                       type="button"
                       className="h-7 px-3 rounded-full text-xs font-semibold text-[#6A7383] bg-[#F2F4F8] hover:bg-[#E9ECF2] transition"
-                      onClick={() => setNewUserSelectedAsins(addVisibilityOptions.map((item) => item.asin))}
+                      onClick={() =>
+                        setNewUserSelectedAsins(
+                          addVisibilityOptions.map((item) =>
+                            buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE)
+                          )
+                        )
+                      }
                       disabled={creating || productOptionsLoading || addVisibilityOptions.length === 0 || !newPermissionEditable}
                     >
                       全选
@@ -1784,7 +2512,7 @@ export function PermissionBoard({
                         value={newPermissionSearch}
                         onChange={(e) => setNewPermissionSearch(e.target.value)}
                         disabled={creating || productOptionsLoading}
-                        className="w-full h-9 pl-11 pr-6 rounded-full bg-[#F4F6FA] border-none text-[13px] text-gray-700 placeholder:text-[#97A0AF] outline-none focus:ring-2 focus:ring-[#3B82F6]/10 transition-all font-medium"
+                        className="w-full h-9 pl-11 pr-6 rounded-xl bg-[#F4F6FA] border-none text-[13px] text-gray-700 placeholder:text-[#97A0AF] outline-none focus:ring-2 focus:ring-[#3B82F6]/10 transition-all font-medium"
                       />
                     </div>
                   </div>
@@ -1812,10 +2540,11 @@ export function PermissionBoard({
                           </tr>
                         )}
                         {filteredAddVisibilityOptions.map((item) => {
-                          const checked = newUserSelectedAsins.includes(item.asin);
+                          const permissionKey = buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE);
+                          const checked = newUserSelectedAsins.includes(permissionKey);
                           return (
                             <tr
-                              key={item.asin}
+                              key={`${item.asin}-${item.site || DEFAULT_PERMISSION_SITE}`}
                               className={`${checked ? "bg-blue-50/70 text-[#111827]" : "hover:bg-gray-50 text-[#111827]"}`}
                             >
                               <td className="py-2.5 px-3 text-center text-[12px] font-semibold">
@@ -1860,7 +2589,7 @@ export function PermissionBoard({
                                   type="checkbox"
                                   className="h-4 w-4 accent-[#0C1731]"
                                   checked={checked}
-                                  onChange={(e) => toggleNewSelectedAsin(item.asin, e.target.checked)}
+                                  onChange={(e) => toggleNewSelectedAsin(permissionKey, e.target.checked)}
                                   disabled={creating || productOptionsLoading || !newPermissionEditable}
                                 />
                               </td>
@@ -1939,6 +2668,39 @@ export function PermissionBoard({
         </div>
       )}
 
+      {groupDeleteTarget && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 px-4 backdrop-blur-[4px] transition-all">
+          <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl p-8 transform transition-all scale-100 animate-in fade-in zoom-in duration-300">
+            <div className="flex flex-col items-center text-center">
+              <h3 className="text-xl font-bold text-gray-900 mb-2">确认删除组？</h3>
+              <p className="text-gray-500 text-sm mb-8 leading-relaxed">
+                您确定要删除组 <span className="font-bold text-gray-900">{groupDeleteTarget}</span> 吗？<br />
+                此操作无法撤销。
+              </p>
+              {groupDeleteError && (
+                <div className="w-full mb-4 text-center text-sm text-red-500">{groupDeleteError}</div>
+              )}
+              <div className="flex gap-3 w-full">
+                <button
+                  className="flex-1 py-3.5 rounded-2xl text-sm font-bold text-gray-500 bg-gray-50 hover:bg-gray-100 hover:text-gray-700 transition-all active:scale-95"
+                  onClick={closeDeleteGroupModal}
+                  disabled={groupDeleteSubmitting}
+                >
+                  取消
+                </button>
+                <button
+                  className="flex-1 py-3.5 rounded-2xl text-sm font-bold text-white bg-gradient-to-br from-red-500 to-red-600 hover:shadow-lg hover:shadow-red-100 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
+                  onClick={confirmDeleteGroup}
+                  disabled={groupDeleteSubmitting}
+                >
+                  {groupDeleteSubmitting ? "删除中..." : "确认删除"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showEditModal && (
         <div className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center p-4">
           <div className="bg-white rounded-[22px] shadow-[0_12px_40px_rgba(15,23,42,0.14)] w-full max-w-5xl p-6 md:p-8 max-h-[90vh] overflow-y-auto">
@@ -1973,11 +2735,12 @@ export function PermissionBoard({
                 <div className={fieldLabelClass}>角色</div>
                 <FormSelect
                   value={editRole}
-                  onChange={(e) => setEditRole(e.target.value as "admin" | "operator")}
+                  onChange={(e) => setEditRole(e.target.value as "admin" | "team_lead" | "operator")}
                   className="h-11 !rounded-xl border-[#E9EDF3] bg-[#F4F6FA] text-[#1F2937] font-semibold"
                   disabled={editSaving}
                 >
                   <option value="admin">管理员</option>
+                  <option value="team_lead">运营组长</option>
                   <option value="operator">运营人员</option>
                 </FormSelect>
               </div>
@@ -2002,30 +2765,16 @@ export function PermissionBoard({
                   {editLoading && <div className="text-xs text-gray-400">正在加载产品权限...</div>}
                 </div>
 
-                <div className="mb-4 flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <button
-                      type="button"
-                      className="h-7 px-3 rounded-full text-xs font-semibold text-[#6A7383] bg-[#F2F4F8] hover:bg-[#E9ECF2] transition"
-                      onClick={() => setEditSelectedAsins(visibilityOptions.map((item) => item.asin))}
-                      disabled={editSaving || editLoading || productOptionsLoading || visibilityOptions.length === 0 || !permissionEditable}
-                    >
-                      全选
-                    </button>
-                    <button
-                      type="button"
-                      className="h-7 px-3 rounded-full text-xs font-semibold text-[#6A7383] bg-[#F2F4F8] hover:bg-[#E9ECF2] transition"
-                      onClick={() => setEditSelectedAsins([])}
-                      disabled={editSaving || editLoading || productOptionsLoading || editSelectedAsins.length === 0 || !permissionEditable}
-                    >
-                      清空
-                    </button>
-                  </div>
-                  <div className="flex items-center gap-3 flex-1 max-w-xl">
-                    <div className="relative w-[148px]" ref={editSiteDropdownRef}>
+                <div className="mb-4 space-y-3">
+                  <div className="flex items-center gap-3 w-full">
+                    <div className="relative w-[120px]" ref={editSiteDropdownRef}>
                       <button
                         type="button"
-                        onClick={() => setEditSiteDropdownOpen((prev) => !prev)}
+                        onClick={() => {
+                          setEditSiteDropdownOpen((prev) => !prev);
+                          setEditCategoryDropdownOpen(false);
+                          setEditBrandDropdownOpen(false);
+                        }}
                         disabled={editSaving || editLoading || productOptionsLoading}
                         className="w-full h-9 px-3 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] disabled:opacity-60"
                       >
@@ -2068,6 +2817,82 @@ export function PermissionBoard({
                         </div>
                       )}
                     </div>
+                    <div className="relative w-[148px]" ref={editBrandDropdownRef}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditBrandDropdownOpen((prev) => !prev);
+                          setEditSiteDropdownOpen(false);
+                          setEditCategoryDropdownOpen(false);
+                        }}
+                        disabled={editSaving || editLoading || productOptionsLoading || editBrandOptions.length === 0}
+                        className="w-full h-9 px-3 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] disabled:opacity-60"
+                      >
+                        <span className="truncate">{editBrandLabel}</span>
+                        <CaretDown
+                          size={14}
+                          className={`text-[#7A8596] transition-transform ${editBrandDropdownOpen ? "rotate-180" : ""}`}
+                        />
+                      </button>
+                      {editBrandDropdownOpen && (
+                        <div className="absolute left-0 top-[42px] z-30 w-full rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2 max-h-60 overflow-y-auto">
+                          <label className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer">
+                            <input
+                              type="checkbox"
+                              className="h-4 w-4 accent-[#0C1731]"
+                              checked={editBrandFilters.length === 0}
+                              onChange={() => setEditBrandFilters([])}
+                            />
+                            全部品牌
+                          </label>
+                          <div className="my-1 h-px bg-[#EEF2F7]" />
+                          {editBrandOptions.map((brand) => (
+                            <label
+                              key={`edit-brand-${brand}`}
+                              className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
+                            >
+                              <input
+                                type="checkbox"
+                                className="h-4 w-4 accent-[#0C1731]"
+                                checked={editBrandFilters.includes(brand)}
+                                onChange={() => toggleEditBrand(brand)}
+                              />
+                              <span className="truncate">{brand}</span>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div className="relative w-[380px]">
+                      <Cascader
+                        options={categoryTreeOptions}
+                        value={(editCategoryPath.length > 0 ? editCategoryPath : undefined) as any}
+                        onChange={(value) => {
+                          const nextPath = Array.isArray(value) ? (value as string[]).map((item) => String(item || "")) : [];
+                          setEditCategoryPath(nextPath);
+                          const leaf = getCategoryLeafFromPath(nextPath);
+                          setEditCategoryFilters(leaf ? [leaf] : []);
+                          setEditCategoryDropdownOpen(false);
+                        }}
+                        placeholder="全部类目"
+                        allowClear
+                        showSearch
+                        expandTrigger="hover"
+                        placement="bottomLeft"
+                        open={editCategoryDropdownOpen}
+                        onDropdownVisibleChange={(open) => {
+                          setEditCategoryDropdownOpen(open);
+                          if (open) {
+                            setEditSiteDropdownOpen(false);
+                            setEditBrandDropdownOpen(false);
+                          }
+                        }}
+                        popupClassName="permission-category-cascader-dropdown"
+                        getPopupContainer={() => document.body}
+                        className="w-full category-cascader permission-category-cascader"
+                        disabled={editSaving || editLoading || productOptionsLoading || editCategoryOptions.length === 0}
+                      />
+                    </div>
                     <div className="relative flex-1 group">
                       <MagnifyingGlass
                         size={16}
@@ -2079,9 +2904,31 @@ export function PermissionBoard({
                         value={permissionSearch}
                         onChange={(e) => setPermissionSearch(e.target.value)}
                         disabled={editSaving || editLoading || productOptionsLoading}
-                        className="w-full h-9 pl-11 pr-6 rounded-full bg-[#F4F6FA] border-none text-[13px] text-gray-700 placeholder:text-[#97A0AF] outline-none focus:ring-2 focus:ring-[#3B82F6]/10 transition-all font-medium"
+                        className="w-full h-9 pl-11 pr-6 rounded-xl bg-[#F4F6FA] border-none text-[13px] text-gray-700 placeholder:text-[#97A0AF] outline-none focus:ring-2 focus:ring-[#3B82F6]/10 transition-all font-medium"
                       />
                     </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      className="h-7 px-3 rounded-full text-xs font-semibold text-[#6A7383] bg-[#F2F4F8] hover:bg-[#E9ECF2] transition"
+                      onClick={() =>
+                        setEditSelectedAsins((prev) =>
+                          Array.from(new Set([...prev, ...filteredVisibilityKeys]))
+                        )
+                      }
+                      disabled={editSaving || editLoading || productOptionsLoading || filteredVisibilityKeys.length === 0 || !permissionEditable}
+                    >
+                      全选
+                    </button>
+                    <button
+                      type="button"
+                      className="h-7 px-3 rounded-full text-xs font-semibold text-[#6A7383] bg-[#F2F4F8] hover:bg-[#E9ECF2] transition"
+                      onClick={() => setEditSelectedAsins([])}
+                      disabled={editSaving || editLoading || productOptionsLoading || editSelectedAsins.length === 0 || !permissionEditable}
+                    >
+                      清空
+                    </button>
                   </div>
                 </div>
 
@@ -2107,10 +2954,11 @@ export function PermissionBoard({
                           </tr>
                         )}
                         {filteredVisibilityOptions.map((item) => {
-                          const checked = editSelectedAsins.includes(item.asin);
+                          const permissionKey = buildPermissionKey(item.asin, item.site || DEFAULT_PERMISSION_SITE);
+                          const checked = editSelectedAsins.includes(permissionKey);
                           return (
                             <tr
-                              key={item.asin}
+                              key={`${item.asin}-${item.site || DEFAULT_PERMISSION_SITE}`}
                               className={`${checked ? "bg-blue-50/70 text-[#111827]" : "hover:bg-gray-50 text-[#111827]"}`}
                             >
                               <td className="py-2.5 px-3 text-center text-[12px] font-semibold">
@@ -2155,7 +3003,7 @@ export function PermissionBoard({
                                   type="checkbox"
                                   className="h-4 w-4 accent-[#0C1731]"
                                   checked={checked}
-                                  onChange={(e) => toggleSelectedAsin(item.asin, e.target.checked)}
+                                  onChange={(e) => toggleSelectedAsin(permissionKey, e.target.checked)}
                                   disabled={editSaving || editLoading || productOptionsLoading || !permissionEditable}
                                 />
                               </td>

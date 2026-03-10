@@ -39,11 +39,11 @@ def build_keepa_report_user_prompt(
 - 数据周期: {summary.get("date_start", "")} ~ {summary.get("date_end", "")}
 - 分析日期: {today}
 - 观察窗口: 最近{range_days}天
-- 数据来源: fact_bsr_daily
+- 数据来源: fact_bi_amazon_product_day
 
 字段说明：
 - date, buybox_price, price, prime_price, coupon_price, coupon_discount
-- child_sales, fba_price, fbm_price, strikethrough_price
+- child_sales, sales_volume, fba_price, fbm_price, strikethrough_price
 - bsr_rank, bsr_reciprocating_saw_blades, rating, rating_count, seller_count
 
 原始数据（按日期升序，JSON数组）：

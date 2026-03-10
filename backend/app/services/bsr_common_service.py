@@ -94,8 +94,11 @@ def bsr_row_to_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "parent_asin": row.get("parent_asin") or "",
         "title": row.get("title") or "",
         "brand": row.get("brand") or "",
+        "category": row.get("category") or "",
         "price": price_to_string(row.get("price")),
         "list_price": price_to_string(row.get("list_price")),
+        "coupon_price": to_float(row.get("coupon_price"), 0.0) if row.get("coupon_price") is not None else None,
+        "coupon_discount": to_float(row.get("coupon_discount"), 0.0) if row.get("coupon_discount") is not None else None,
         "rating": to_float(row.get("score")),
         "score": to_float(row.get("score")),
         "reviews": to_int(row.get("comment_count")),
@@ -119,6 +122,7 @@ def bsr_row_to_item(row: Dict[str, Any]) -> Dict[str, Any]:
         else None,
         "sales_volume": to_int(row.get("sales_volume")),
         "sales": to_float(row.get("sales")),
+        "is_limited_time_deal": to_int(row.get("is_limited_time_deal"), 0),
         "createtime": row.get("createtime").isoformat()
         if isinstance(row.get("createtime"), date)
         else None,

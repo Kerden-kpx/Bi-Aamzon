@@ -5,11 +5,19 @@ import {
   Cube,
   ShoppingBag,
   Shield,
-  Snowflake,
 } from "@phosphor-icons/react";
 import { Suspense, lazy, useEffect, useState } from "react";
 
-import { getStoredUser, getUserAvatar, getUserName, getUserRole } from "./auth/user";
+import { syncDebugActorHeader } from "./auth/dingtalk";
+import {
+  getDebugActor,
+  getStoredUser,
+  getUserAvatar,
+  getUserName,
+  getUserRole,
+  setDebugActor,
+  type DebugActor,
+} from "./auth/user";
 
 type Page =
   | "overview"
@@ -51,11 +59,19 @@ function PageLoading({ collapsed }: { collapsed: boolean }) {
 export default function App() {
   const [, setUserVersion] = useState(0);
   const storedUser = getStoredUser();
+  const apiBase = import.meta.env.VITE_API_BASE_URL || "";
   const [currentPage, setCurrentPage] = useState<Page>("overview");
   const [collapsed, setCollapsed] = useState(false);
   const [userRole] = useState(() => getUserRole(storedUser));
-  const isAdmin = userRole === "admin";
-  const displayName = getUserName(storedUser) || "未登录";
+  const [debugActor, setDebugActorState] = useState<DebugActor | null>(() => getDebugActor());
+  const [activeRole, setActiveRole] = useState(userRole);
+  const testModeEnabled = String(import.meta.env.VITE_ENABLE_TEST_MODE || "").trim().toLowerCase() === "true";
+  const canManagePermissions = activeRole === "admin" || activeRole === "team_lead";
+  const displayName = debugActor === "user_a"
+    ? "测试用户A"
+    : debugActor === "user_b"
+      ? "测试用户B"
+      : (getUserName(storedUser) || "未登录");
   const avatarUrl = getUserAvatar(storedUser);
   const fallbackAvatar = `https://i.pravatar.cc/150?u=${encodeURIComponent(displayName)}`;
   const handleToggleCollapsed = () => setCollapsed((prev) => !prev);
@@ -67,17 +83,56 @@ export default function App() {
     return () => window.removeEventListener("auth_user_updated", handler);
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = () => setDebugActorState(getDebugActor());
+    window.addEventListener("debug_actor_updated", handler);
+    return () => window.removeEventListener("debug_actor_updated", handler);
+  }, []);
+
+  useEffect(() => {
+    if (userRole === "admin" && testModeEnabled) return;
+    if (getDebugActor()) {
+      setDebugActor(null);
+    }
+  }, [userRole, testModeEnabled]);
+
+  useEffect(() => {
+    syncDebugActorHeader();
+  }, [debugActor]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshEffectiveUser = async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/auth/me`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const role = String(data?.user?.role || "").trim().toLowerCase();
+        if (!cancelled && (role === "admin" || role === "team_lead" || role === "operator")) {
+          setActiveRole(role);
+        }
+      } catch {
+        // keep previous role when request fails
+      }
+    };
+    refreshEffectiveUser();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiBase, debugActor, userRole]);
+
   const navItems = [
     { key: "overview" as Page, icon: <ChartPieSlice weight="fill" />, label: "Overview" },
-    { key: "bsr" as Page, icon: <ShoppingBag />, label: "BSR" },
+    { key: "bsr" as Page, icon: <ShoppingBag />, label: "Best Sellers" },
     { key: "products" as Page, icon: <Cube />, label: "Products" },
     { key: "todo" as Page, icon: <CheckCircle />, label: "ToDo" },
     { key: "ai-insights" as Page, icon: <ChartLineUp />, label: "AI Insights" },
-    ...(isAdmin ? [{ key: "permissions" as Page, icon: <Shield />, label: "Permissions" }] : []),
+    ...(canManagePermissions ? [{ key: "permissions" as Page, icon: <Shield />, label: "Permissions" }] : []),
   ];
 
   const renderCurrentPage = () => {
-    if (currentPage === "permissions" && !isAdmin) {
+    if (currentPage === "permissions" && !canManagePermissions) {
       return <OverviewBoard collapsed={collapsed} onToggleCollapse={handleToggleCollapsed} />;
     }
     if (currentPage === "bsr") {
@@ -85,7 +140,6 @@ export default function App() {
         <BsrBoard
           collapsed={collapsed}
           onToggleCollapse={handleToggleCollapsed}
-          onViewAllProducts={() => setCurrentPage("products")}
           onOpenAiInsights={() => setCurrentPage("ai-insights")}
         />
       );
@@ -100,7 +154,7 @@ export default function App() {
       return <AiInsightsBoard collapsed={collapsed} onToggleCollapse={handleToggleCollapsed} />;
     }
     if (currentPage === "permissions") {
-      return <PermissionBoard collapsed={collapsed} onToggleCollapse={handleToggleCollapsed} />;
+      return <PermissionBoard collapsed={collapsed} onToggleCollapse={handleToggleCollapsed} currentRole={activeRole} />;
     }
     return <OverviewBoard collapsed={collapsed} onToggleCollapse={handleToggleCollapsed} />;
   };
@@ -112,7 +166,7 @@ export default function App() {
           <div className={`p-6 flex items-center ${collapsed ? "justify-center" : "justify-between"}`}>
             <div className="flex items-center gap-2">
               <div className="text-blue-500 text-3xl">
-                <Snowflake weight="fill" />
+                <img src="/logo.png" alt="Logo" className="w-9 h-9 object-contain" />
               </div>
               {!collapsed && (
                 <h1 className="text-xl font-bold tracking-tight text-gray-900">
@@ -146,7 +200,32 @@ export default function App() {
                 alt="User"
                 className="w-8 h-8 rounded-full bg-gray-200"
               />
-              {!collapsed && <span className="text-sm font-medium text-gray-700">{displayName}</span>}
+              {!collapsed && (
+                <div className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium text-gray-700">{displayName}</span>
+                  {userRole === "admin" && testModeEnabled && (
+                    <div className="mt-2">
+                      <label className="block text-[10px] text-gray-400 mb-1">测试身份</label>
+                      <select
+                        value={debugActor || ""}
+                        onChange={(e) => {
+                          const next = String(e.target.value || "").trim();
+                          if (next === "user_a" || next === "user_b") {
+                            setDebugActor(next);
+                            return;
+                          }
+                          setDebugActor(null);
+                        }}
+                        className="w-full text-[11px] rounded-lg border border-gray-200 px-2 py-1 bg-gray-50 text-gray-700 mb-2"
+                      >
+                        <option value="">真实用户</option>
+                        <option value="user_a">测试用户A（运营）</option>
+                        <option value="user_b">测试用户B（组长）</option>
+                      </select>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </aside>

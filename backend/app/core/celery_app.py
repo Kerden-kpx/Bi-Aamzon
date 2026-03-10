@@ -19,7 +19,6 @@ celery_app = Celery(
     backend=result_backend,
     include=[
         "app.tasks.ai_insight_tasks",
-        "app.tasks.export_daily_tasks",
     ],
 )
 

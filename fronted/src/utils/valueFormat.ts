@@ -1,3 +1,16 @@
+const SITE_CURRENCY_SYMBOL: Record<string, string> = {
+  US: "$",
+  CA: "C$",
+  UK: "£",
+  DE: "€",
+  JP: "¥",
+};
+
+export const getCurrencySymbol = (site?: string) => {
+  const normalizedSite = String(site || "US").trim().toUpperCase();
+  return SITE_CURRENCY_SYMBOL[normalizedSite] || "$";
+};
+
 export const toFiniteNumber = (value: unknown): number | null => {
   if (typeof value === "number") {
     return Number.isFinite(value) ? value : null;
@@ -24,16 +37,16 @@ export const formatNumber = (value: unknown, fallback = "-") => {
   return parsed.toLocaleString();
 };
 
-export const formatMoney = (value: unknown, fallback = "-") => {
+export const formatMoney = (value: unknown, fallback = "-", site?: string) => {
   const parsed = toFiniteNumber(value);
   if (parsed === null) return fallback;
-  return `$${parsed.toFixed(2)}`;
+  return `${getCurrencySymbol(site)}${parsed.toFixed(2)}`;
 };
 
-export const formatSalesMoney = (value: unknown, fallback = "-") => {
+export const formatSalesMoney = (value: unknown, fallback = "-", site?: string) => {
   const parsed = toFiniteNumber(value);
   if (parsed === null) return fallback;
-  return `$${Math.round(parsed).toLocaleString()}`;
+  return `${getCurrencySymbol(site)}${Math.round(parsed).toLocaleString()}`;
 };
 
 export const formatTrafficShare = (

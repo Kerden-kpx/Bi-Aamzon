@@ -1,31 +1,40 @@
 import {
-  ArrowRight,
+  Bell,
+  CalendarBlank,
   CaretDown,
-  ChartLineUp,
   CheckCircle,
+  ClipboardText,
+  Clock,
   Funnel,
+  Flag,
   MagnifyingGlass,
   SidebarSimple,
   Star,
   Sun,
-  DownloadSimple,
-  ArrowsClockwise,
-  UploadSimple,
+  User,
+  UserPlus,
   WarningCircle,
   Info,
   X,
   Check,
   CornersOut,
 } from "@phosphor-icons/react";
+import { Cascader } from "antd";
 import * as echarts from "echarts";
-import { memo, useCallback, useMemo, useState, useRef, useEffect, type ReactNode, type SetStateAction } from "react";
+import { memo, useCallback, useDeferredValue, useMemo, useState, useRef, useEffect, useLayoutEffect, type ReactNode, type SetStateAction } from "react";
 
 import { getStoredUser, getUserId, getUserName, getUserRole } from "../auth/user";
 import { AppDatePicker } from "../components/AppDatePicker";
 import { ConversionRateBadge } from "../components/ConversionRateBadge";
 import { FormInput, FormSelect } from "../components/FormControls";
+import { ProductCardSkeletons } from "../components/ProductCardSkeletons";
 import { TagManagerModal } from "../components/TagManagerModal";
 import { TagPillList, parseTagList } from "../components/TagSystem";
+import {
+  fetchCategoryTreeOptions,
+  findCategoryPathByLeaf,
+  getCategoryLeafFromPath,
+} from "../constants/productCategories";
 import { PRODUCT_STATUS_COLOR } from "../constants/productStatus";
 import { mockConfig } from "../mock/data";
 import {
@@ -40,10 +49,9 @@ import {
   formatSalesMoney as formatSalesMoneyValue,
   formatText as formatTextValue,
   formatTrafficShare as formatTrafficShareValue,
+  getCurrencySymbol,
   toCount as toCountValue,
 } from "../utils/valueFormat";
-
-const parsePrice = (value: string) => Number.parseFloat(value.replace("$", ""));
 
 type BsrItem = {
   asin: string;
@@ -53,9 +61,12 @@ type BsrItem = {
   image_url?: string;
   product_url?: string;
   brand?: string;
+  category?: string | null;
   parent_asin?: string;
   price?: string | number | null;
   list_price?: string | number | null;
+  coupon_price?: string | number | null;
+  coupon_discount?: string | number | null;
   rating?: number | string | null;
   score?: number | string | null;
   reviews?: number | string | null;
@@ -73,11 +84,14 @@ type BsrItem = {
   search_recommend_terms?: number | string | null;
   sales_volume?: number | string | null;
   sales?: number | string | null;
+  is_limited_time_deal?: number | string | boolean | null;
   tags?: string[] | null;
   yida_asin?: string | null;
   createtime?: string | null;
   status?: string | null;
   rank?: number | string | null;
+  prev_bsr_rank?: number | string | null;
+  rank_change?: number | string | null;
   [key: string]: unknown;
 };
 
@@ -86,11 +100,12 @@ type ProductLibraryItem = {
   site?: string;
   product?: string;
   name?: string;
+  category?: string | null;
   brand?: string;
   sku?: string;
   status?: string;
   application_tags?: string | null;
-  tooth_pattern_tags?: string | null;
+  other_tags?: string | null;
   material_tags?: string | null;
   position_tags?: string | string[] | null;
   position_tags_raw?: string | null;
@@ -108,7 +123,11 @@ type StrategyTask = {
   detail?: string;
   owner?: string;
   owner_userid?: string;
+  participant_userids?: string[] | string | null;
+  participant_names?: string[] | string | null;
   review_date?: string;
+  deadline_time?: string;
+  reminder_time?: string;
   priority?: string;
   state?: string;
   brand?: string;
@@ -120,10 +139,11 @@ type ProductFormState = {
   sku: string;
   asin: string;
   name: string;
+  category: string;
   brand: string;
   status: string;
   application_tags: string;
-  tooth_pattern_tags: string;
+  other_tags: string;
   material_tags: string;
   spec_length: string;
   spec_quantity?: number;
@@ -146,6 +166,54 @@ type BsrHistoryRow = {
   bsr_rank?: number | string | null;
   bsr_reciprocating_saw_blades?: number | string | null;
   [key: string]: unknown;
+};
+
+type BsrListCacheEntry = {
+  items: BsrItem[];
+  prevMap: Record<string, BsrItem>;
+  loadedKey: string;
+  expiresAt: number;
+};
+
+const BSR_LIST_CACHE_TTL_MS = 2 * 60 * 1000;
+const bsrListCache = new Map<string, BsrListCacheEntry>();
+
+const buildBsrListCacheKey = (
+  site: string,
+  dateValue: string,
+  compareDate: string,
+  filterSignature = "",
+) =>
+  `${String(site || "US").trim().toUpperCase()}|${String(dateValue || "").trim()}|${String(compareDate || "").trim()}|${filterSignature}`;
+
+const buildBsrDetailCacheKey = (item: Pick<BsrItem, "asin" | "site" | "createtime" | "brand">) =>
+  [
+    String(item?.site || "US").trim().toUpperCase(),
+    String(item?.asin || "").trim().toUpperCase(),
+    String(item?.createtime || "").trim(),
+    String(item?.brand || "").trim().toUpperCase(),
+  ].join("|");
+
+const LIBRARY_PAGE_SIZE = 40;
+
+const buildPrevItemsMap = (nextItems: BsrItem[]): Record<string, BsrItem> => {
+  const prevMap: Record<string, BsrItem> = {};
+  nextItems.forEach((item) => {
+    const asin = String(item?.asin || "").trim();
+    const prevRank = Number(item?.prev_bsr_rank);
+    if (!asin || !Number.isFinite(prevRank) || prevRank <= 0) return;
+    prevMap[asin] = { asin, bsr_rank: prevRank };
+  });
+  return prevMap;
+};
+
+const setBsrListCache = (cacheKey: string, loadedKey: string, nextItems: BsrItem[]) => {
+  bsrListCache.set(cacheKey, {
+    items: nextItems,
+    prevMap: buildPrevItemsMap(nextItems),
+    loadedKey,
+    expiresAt: Date.now() + BSR_LIST_CACHE_TTL_MS,
+  });
 };
 
 type LibraryHoverPayload = {
@@ -227,23 +295,75 @@ const isOwnProduct = (item: BsrItem) => isOwnTypeValue(resolveItemType(item));
 
 const statusColor = PRODUCT_STATUS_COLOR;
 
-type FilterKey = "brand" | "price" | "rating" | "label" | "date" | "site";
+type FilterKey = "brand" | "price" | "rating" | "label" | "date" | "compareDate" | "site" | "category";
 type SidebarFilterKey = "brand" | "tag";
+type CategoryTreeNode = {
+  value: string;
+  label: string;
+  children?: CategoryTreeNode[];
+};
 type MonthlyTrendPoint = {
   month: string;
   salesVolume: number;
   salesAmount: number | null;
 };
 
+const parseDateStamp = (value: string) => {
+  const stamp = Date.parse(`${String(value || "").trim()}T00:00:00Z`);
+  return Number.isNaN(stamp) ? null : stamp;
+};
+
+const formatDateYmd = (date: Date) => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+};
+
+const useDebouncedValue = <T,>(value: T, delayMs: number): T => {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedValue(value);
+    }, delayMs);
+    return () => window.clearTimeout(timer);
+  }, [delayMs, value]);
+
+  return debouncedValue;
+};
+
+const resolveDefaultCompareDate = (currentDate: string, options: string[]) => {
+  const currentStamp = parseDateStamp(currentDate);
+  if (!currentStamp || options.length === 0) {
+    return "";
+  }
+  const targetStamp = currentStamp - 7 * 24 * 60 * 60 * 1000;
+  let bestOlderWithinWeek: { date: string; stamp: number } | null = null;
+  let fallbackOlder: string | null = null;
+
+  options.forEach((date) => {
+    if (!date || date === currentDate) return;
+    const stamp = parseDateStamp(date);
+    if (!stamp || stamp >= currentStamp) return;
+    if (!fallbackOlder) fallbackOlder = date;
+    if (stamp <= targetStamp) {
+      if (!bestOlderWithinWeek || stamp > bestOlderWithinWeek.stamp) {
+        bestOlderWithinWeek = { date, stamp };
+      }
+    }
+  });
+
+  return bestOlderWithinWeek?.date || fallbackOlder || "";
+};
+
 export function BsrBoard({
   collapsed = false,
   onToggleCollapse,
-  onViewAllProducts,
   onOpenAiInsights,
 }: {
   collapsed?: boolean;
   onToggleCollapse?: () => void;
-  onViewAllProducts?: () => void;
   onOpenAiInsights?: () => void;
 }) {
   const isDev = import.meta.env.DEV;
@@ -253,6 +373,15 @@ export function BsrBoard({
     }
   };
   const [authUser] = useState(() => getStoredUser());
+  const [effectiveUser, setEffectiveUser] = useState<{
+    userid: string;
+    username: string;
+    role: "admin" | "team_lead" | "operator";
+  } | null>(null);
+  const [categoryTreeOptions, setCategoryTreeOptions] = useState<CategoryTreeNode[]>([]);
+  useEffect(() => {
+    fetchCategoryTreeOptions().then(setCategoryTreeOptions);
+  }, []);
   const handleToggleCollapse = () => onToggleCollapse?.();
   const handleToggleFullscreen = () => {
     if (document.fullscreenElement) {
@@ -262,23 +391,34 @@ export function BsrBoard({
     document.documentElement.requestFullscreen?.();
   };
   const userRole = getUserRole(authUser);
-  const isAdmin = userRole === "admin";
-  const currentUserName = getUserName(authUser);
-  const currentUserId = getUserId(authUser);
+  const effectiveRole = String(effectiveUser?.role || userRole || "operator").trim().toLowerCase();
+  const isAdmin = effectiveRole === "admin";
+  const canAssignStrategyOwner = isAdmin || effectiveRole === "team_lead";
+  const canLoadStrategyUserOptions = effectiveRole === "admin" || effectiveRole === "team_lead";
+  const currentUserName = String(effectiveUser?.username || getUserName(authUser) || "");
+  const currentUserId = String(effectiveUser?.userid || getUserId(authUser) || "");
   const { bsr } = mockConfig;
   const ratingOptions = bsr.ratingOptions;
   const [items, setItems] = useState<BsrItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadedKey, setLoadedKey] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [libraryItems, setLibraryItems] = useState<ProductLibraryItem[]>([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [libraryLoadEnabled, setLibraryLoadEnabled] = useState(false);
+  const [libraryLoadingMore, setLibraryLoadingMore] = useState(false);
+  const [libraryHasMore, setLibraryHasMore] = useState(false);
+  const [libraryOffset, setLibraryOffset] = useState(0);
+  const [trendPrefetchEnabled, setTrendPrefetchEnabled] = useState(false);
   const [selectedLibraryItem, setSelectedLibraryItem] = useState<ProductLibraryItem | null>(null);
   const [mappingModalOpen, setMappingModalOpen] = useState(false);
   const [mappingLeft, setMappingLeft] = useState<BsrItem | null>(null);
   const [mappingRight, setMappingRight] = useState<BsrItem | null>(null);
   const [mappingRightMeta, setMappingRightMeta] = useState<ProductLibraryItem | null>(null);
   const [compareTargetAsin, setCompareTargetAsin] = useState("");
+  const [compareTypeFilter, setCompareTypeFilter] = useState<"自家" | "竞品">("自家");
+  const [compareBrandFilter, setCompareBrandFilter] = useState("全部");
   const [mappingLoading, setMappingLoading] = useState(false);
   const [mappingError, setMappingError] = useState<string | null>(null);
   const [mappingActionLoading, setMappingActionLoading] = useState(false);
@@ -291,17 +431,17 @@ export function BsrBoard({
   const [hiddenLibraryTagsState, setHiddenLibraryTagsState] = useState<string[]>([]);
   const [fieldTagModalOpen, setFieldTagModalOpen] = useState(false);
   const [activeFieldTag, setActiveFieldTag] = useState<
-    "application_tags" | "tooth_pattern_tags" | "material_tags" | "position_tags" | null
+    "application_tags" | "other_tags" | "material_tags" | "position_tags" | null
   >(null);
   const [fieldCustomTags, setFieldCustomTags] = useState<Record<string, string[]>>({
     application_tags: [],
-    tooth_pattern_tags: [],
+    other_tags: [],
     material_tags: [],
     position_tags: [],
   });
   const [fieldHiddenTags, setFieldHiddenTags] = useState<Record<string, string[]>>({
     application_tags: [],
-    tooth_pattern_tags: [],
+    other_tags: [],
     material_tags: [],
     position_tags: [],
   });
@@ -312,10 +452,11 @@ export function BsrBoard({
     sku: "",
     asin: "",
     name: "",
+    category: "",
     brand: "",
     status: "在售",
     application_tags: "",
-    tooth_pattern_tags: "",
+    other_tags: "",
     material_tags: "",
     spec_length: "",
     spec_quantity: undefined,
@@ -325,6 +466,7 @@ export function BsrBoard({
   const [productBsrForm, setProductBsrForm] = useState<BsrFormState>(createEmptyBsrForm());
   const [productBsrImageError, setProductBsrImageError] = useState<string | null>(null);
   const [productBsrImageInputKey, setProductBsrImageInputKey] = useState(0);
+  const modalCategoryCascaderRef = useRef<HTMLDivElement | null>(null);
 
   // Strategy Form States
   const [strategyOpen, setStrategyOpen] = useState(false);
@@ -335,8 +477,11 @@ export function BsrBoard({
     detail: "",
     owner: "",
     owner_userid: "",
+    participant_userids: [] as string[],
     review_date: "",
-    priority: "中",
+    deadline_time: "18:00",
+    reminder_time: "无",
+    priority: "普通",
     state: "待开始",
   });
   const [strategyEditSaving, setStrategyEditSaving] = useState(false);
@@ -356,8 +501,12 @@ export function BsrBoard({
     detail: "",
     owner: "",
     owner_userid: "",
+    participant_userids: [] as string[],
     review_date: "",
-    priority: "中",
+    deadline_time: "18:00",
+    reminder_time: "无",
+    priority: "普通",
+    state: "待开始",
   });
   const [strategySaving, setStrategySaving] = useState(false);
 
@@ -370,7 +519,7 @@ export function BsrBoard({
     };
   }, [tagModalOpen, fieldTagModalOpen]);
 
-  const handleStrategyChange = (key: string, value: string) => {
+  const handleStrategyChange = (key: string, value: string | string[]) => {
     setStrategyFormData((prev) => ({ ...prev, [key]: value }));
   };
 
@@ -380,6 +529,7 @@ export function BsrBoard({
       ...prev,
       owner_userid: userid,
       owner: selected?.label || "",
+      participant_userids: userid ? [userid] : [],
     }));
   };
 
@@ -442,6 +592,12 @@ export function BsrBoard({
   };
 
   const openStrategyDetail = (task: StrategyTask) => {
+    const participantUserids = Array.isArray(task.participant_userids)
+      ? task.participant_userids.map((item) => String(item || "").trim()).filter(Boolean)
+      : String(task.participant_userids || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
     setSelectedStrategy(task);
     setStrategyEdit({
       yida_asin: task.yida_asin || "",
@@ -449,8 +605,11 @@ export function BsrBoard({
       detail: task.detail || "",
       owner: task.owner || "",
       owner_userid: task.owner_userid || "",
+      participant_userids: participantUserids,
       review_date: task.review_date || "",
-      priority: task.priority || "中",
+      deadline_time: String(task.deadline_time || "18:00"),
+      reminder_time: String(task.reminder_time || "无"),
+      priority: task.priority || "普通",
       state: task.state || "待开始",
     });
   };
@@ -472,8 +631,11 @@ export function BsrBoard({
           title: strategyEdit.title,
           detail: strategyEdit.detail,
           owner: strategyEdit.owner || null,
-          owner_userid: isAdmin ? strategyEdit.owner_userid || null : currentUserId || null,
+          owner_userid: canAssignStrategyOwner ? strategyEdit.owner_userid || null : currentUserId || null,
+          participant_userids: strategyEdit.participant_userids || [],
           review_date: strategyEdit.review_date || null,
+          deadline_time: String(strategyEdit.deadline_time || "18:00"),
+          reminder_time: String(strategyEdit.reminder_time || "无"),
           priority: strategyEdit.priority,
           state: strategyEdit.state,
         }),
@@ -491,7 +653,7 @@ export function BsrBoard({
         )
       );
       setSelectedStrategy((prev) => (prev ? { ...prev, ...strategyEdit } : prev));
-      showToast("策略已更新！");
+      showToast("待办已更新");
     } catch (err) {
       showToast("更新策略失败，请稍后重试。", "error");
     } finally {
@@ -516,7 +678,7 @@ export function BsrBoard({
           });
           setStrategyTasks((prev) => prev.filter((task) => task.id !== selectedStrategy.id));
           setSelectedStrategy(null);
-          showToast("策略已删除！");
+          showToast("待办已删除");
         } catch (err) {
           showToast("删除失败，请稍后重试。", "error");
         }
@@ -526,11 +688,65 @@ export function BsrBoard({
 
   const handleSaveStrategy = async () => {
     if (!mappingLeft || !mappingRightMeta) return;
+    if (compareTypeFilter !== "自家" || !selectedCompareAsin || !selectedIsMapped) {
+      showToast("仅支持基于已映射的自家ASIN新建待办。", "info");
+      return;
+    }
+
+    const ownerName = canAssignStrategyOwner ? strategyFormData.owner : currentUserName;
+    const resolvedOwnerUserid = canAssignStrategyOwner ? strategyFormData.owner_userid || "" : currentUserId || "";
+    const selectedParticipantUserids = Array.isArray(strategyFormData.participant_userids)
+      ? strategyFormData.participant_userids
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+      : [];
+    const syncedParticipantUserids = Array.from(
+      new Set([
+        ...selectedParticipantUserids,
+        ...(resolvedOwnerUserid ? [resolvedOwnerUserid] : []),
+      ])
+    );
+
+    if (!String(strategyFormData.title || "").trim()) {
+      showToast("待办事项为必填项。", "error");
+      return;
+    }
+    if (!String(strategyFormData.detail || "").trim()) {
+      showToast("描述为必填项。", "error");
+      return;
+    }
+    if (!String(ownerName || "").trim() || !String(resolvedOwnerUserid || "").trim()) {
+      showToast("负责人为必填项。", "error");
+      return;
+    }
+    if (!String(strategyFormData.review_date || "").trim()) {
+      showToast("日期为必填项。", "error");
+      return;
+    }
+    if (!String(strategyFormData.deadline_time || "").trim()) {
+      showToast("截止时间为必填项。", "error");
+      return;
+    }
+    if (!String(strategyFormData.reminder_time || "").trim()) {
+      showToast("提醒时间为必填项。", "error");
+      return;
+    }
+    if (!String(strategyFormData.priority || "").trim()) {
+      showToast("优先级为必填项。", "error");
+      return;
+    }
+    if (!String(strategyFormData.state || "").trim()) {
+      showToast("状态为必填项。", "error");
+      return;
+    }
+    if (syncedParticipantUserids.length === 0) {
+      showToast("参与人为必填项。", "error");
+      return;
+    }
 
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
     setStrategySaving(true);
     try {
-      const ownerName = isAdmin ? strategyFormData.owner : currentUserName;
       const response = await fetch(`${apiBase}/api/yida-strategy`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -541,17 +757,33 @@ export function BsrBoard({
           title: strategyFormData.title,
           detail: strategyFormData.detail,
           owner: ownerName || null,
-          owner_userid: isAdmin ? strategyFormData.owner_userid || null : currentUserId || null,
+          owner_userid: resolvedOwnerUserid || null,
+          participant_userids: syncedParticipantUserids,
           review_date: strategyFormData.review_date || null,
+          deadline_time: String(strategyFormData.deadline_time || "18:00"),
+          reminder_time: String(strategyFormData.reminder_time || "无"),
           priority: strategyFormData.priority,
-          state: "待开始",
+          state: strategyFormData.state || "待开始",
         }),
       });
 
       if (!response.ok) throw new Error("保存失败");
 
-      showToast("策略已保存成功！");
+      showToast("待办已新建成功！");
       await loadStrategies(mappingLeft.asin);
+      setStrategyOpen(false);
+      setStrategyFormData({
+        title: "",
+        detail: "",
+        owner: "",
+        owner_userid: "",
+        participant_userids: [],
+        review_date: "",
+        deadline_time: "18:00",
+        reminder_time: "无",
+        priority: "普通",
+        state: "待开始",
+      });
     } catch (err) {
       showToast("保存策略失败，请稍后重试。", "error");
     } finally {
@@ -590,7 +822,10 @@ export function BsrBoard({
   }, [mappingModalOpen, mappingLeft?.asin]);
 
   useEffect(() => {
-    if (!isAdmin) return;
+    if (!canLoadStrategyUserOptions) {
+      setStrategyOwnerOptions([]);
+      return;
+    }
     const controller = new AbortController();
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
     setStrategyOwnerLoading(true);
@@ -627,7 +862,7 @@ export function BsrBoard({
       });
 
     return () => controller.abort();
-  }, [isAdmin]);
+  }, [canLoadStrategyUserOptions]);
 
   useEffect(() => {
     if (mappingModalOpen) {
@@ -673,7 +908,7 @@ export function BsrBoard({
     };
     return {
       application_tags: build("application_tags"),
-      tooth_pattern_tags: build("tooth_pattern_tags"),
+      other_tags: build("other_tags"),
       material_tags: build("material_tags"),
       position_tags: build("position_tags"),
     };
@@ -681,7 +916,7 @@ export function BsrBoard({
 
   const fieldLabelMap: Record<string, string> = {
     application_tags: "应用标签",
-    tooth_pattern_tags: "齿形标签",
+    other_tags: "其他标签",
     material_tags: "材质标签",
     position_tags: "定位标签",
   };
@@ -727,7 +962,9 @@ export function BsrBoard({
   const [sidebarSearch, setSidebarSearch] = useState("");
   const [selectedBrands, setSelectedBrands] = useState<string[]>([]);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [selectedSidebarCategoryPath, setSelectedSidebarCategoryPath] = useState<string[]>([]);
   const [sidebarOpenDropdown, setSidebarOpenDropdown] = useState<SidebarFilterKey | null>(null);
+  const debouncedSidebarSearch = useDebouncedValue(sidebarSearch, 260);
 
   const sidebarBrandOptions = useMemo(() => {
     const set = new Set<string>();
@@ -747,23 +984,58 @@ export function BsrBoard({
     return Array.from(set);
   }, [libraryItems]);
 
+  const sidebarCategoryOptions = useMemo(() => {
+    return categoryTreeOptions.map((level1) => ({
+      value: String(level1.value || ""),
+      label: String(level1.label || level1.value || ""),
+      children: Array.isArray(level1.children)
+        ? level1.children.map((level2) => ({
+            value: String(level2.value || ""),
+            label: String(level2.label || level2.value || ""),
+          }))
+        : [],
+    }));
+  }, [categoryTreeOptions]);
+
   const filteredSidebarProducts = useMemo(() => {
     return libraryItems.filter((p) => {
-      const keyword = sidebarSearch.toLowerCase();
-      const matchesSearch =
-        !keyword ||
-        String(p.product || "").toLowerCase().includes(keyword) ||
-        String(p.asin || "").toLowerCase().includes(keyword);
-
       const productBrand = String(p.brand || "");
       const matchesBrand = selectedBrands.length === 0 || (productBrand !== "" && selectedBrands.includes(productBrand));
       const matchesTag =
         selectedTags.length === 0 ||
         (Array.isArray(p.tags) ? p.tags : []).some((t: string) => selectedTags.includes(t));
+      const matchesCategory = (() => {
+        if (selectedSidebarCategoryPath.length === 0) return true;
+        const category = String(p.category || "").trim();
+        if (!category) return false;
+        const path = findCategoryPathByLeaf(category);
+        let level1 = "";
+        let level2 = "";
+        if (Array.isArray(path) && path.length >= 2) {
+          level1 = String(path[0] || "").trim();
+          level2 = String(path[1] || "").trim();
+        } else {
+          const parts = category
+            .replace(/＞/g, ">")
+            .split(/>|\/|\\/)
+            .map((item) => item.trim())
+            .filter(Boolean);
+          level1 = String(parts[0] || "").trim();
+          level2 = String(parts[1] || "").trim();
+        }
+        if (!level1) return false;
+        if (selectedSidebarCategoryPath.length === 1) {
+          return level1 === selectedSidebarCategoryPath[0];
+        }
+        return (
+          level1 === selectedSidebarCategoryPath[0] &&
+          level2 === selectedSidebarCategoryPath[1]
+        );
+      })();
 
-      return matchesSearch && matchesBrand && matchesTag;
+      return matchesBrand && matchesTag && matchesCategory;
     });
-  }, [libraryItems, sidebarSearch, selectedBrands, selectedTags]);
+  }, [libraryItems, selectedBrands, selectedSidebarCategoryPath, selectedTags]);
 
   const [search, setSearch] = useState("");
   // key filter states
@@ -775,11 +1047,34 @@ export function BsrBoard({
   });
   const [priceMin, setPriceMin] = useState("");
   const [priceMax, setPriceMax] = useState("");
+  const debouncedSearch = useDebouncedValue(search, 150);
+  const deferredSearch = useDeferredValue(debouncedSearch);
+  const debouncedPriceMin = useDebouncedValue(priceMin, 320);
+  const debouncedPriceMax = useDebouncedValue(priceMax, 320);
   const [siteFilter, setSiteFilter] = useState("US");
-  const siteOptions = ["US", "CA", "UK", "DE"];
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [categoryOptions, setCategoryOptions] = useState<string[]>([]);
+  const activeBrands = filterState.brands;
+  const activeRatings = filterState.ratings;
+  const activeLabels = filterState.labels;
+  const normalizedPriceMin = debouncedPriceMin.trim();
+  const normalizedPriceMax = debouncedPriceMax.trim();
+  const bsrFilterSignature = useMemo(
+    () =>
+      JSON.stringify({
+        brands: [...activeBrands].sort(),
+        ratings: [...activeRatings].sort(),
+        labels: [...activeLabels].sort(),
+        category: categoryFilter,
+        priceMin: normalizedPriceMin,
+        priceMax: normalizedPriceMax,
+      }),
+    [activeBrands, activeLabels, activeRatings, categoryFilter, normalizedPriceMax, normalizedPriceMin],
+  );
+  const siteOptions = ["US", "CA", "UK", "DE", "JP"];
   const [dateFilter, setDateFilter] = useState("");
   const [dateOptions, setDateOptions] = useState<string[]>([]);
-  const [prevDate, setPrevDate] = useState("");
+  const [compareDate, setCompareDate] = useState("");
   const [prevItemsMap, setPrevItemsMap] = useState<Record<string, BsrItem>>({});
   const [dateLoading, setDateLoading] = useState(false);
   const [dateError, setDateError] = useState<string | null>(null);
@@ -790,8 +1085,6 @@ export function BsrBoard({
   const [sellerImportFileNext, setSellerImportFileNext] = useState<File | null>(null);
   const [jimuImportFileNext, setJimuImportFileNext] = useState<File | null>(null);
   const [importLoading, setImportLoading] = useState(false);
-  const [fetchDailyLoading, setFetchDailyLoading] = useState(false);
-  const [fetchDailyJobId, setFetchDailyJobId] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [sellerImportDragging, setSellerImportDragging] = useState(false);
   const [jimuImportDragging, setJimuImportDragging] = useState(false);
@@ -805,17 +1098,32 @@ export function BsrBoard({
   const [historyChildLoading, setHistoryChildLoading] = useState(false);
   const [historyMonthError, setHistoryMonthError] = useState<string | null>(null);
   const [historyChildError, setHistoryChildError] = useState<string | null>(null);
+  const [historyDailyData, setHistoryDailyData] = useState<BsrHistoryRow[]>([]);
   const [historyKeepaData, setHistoryKeepaData] = useState<BsrHistoryRow[]>([]);
+  const [historyDailyLoading, setHistoryDailyLoading] = useState(false);
   const [historyKeepaLoading, setHistoryKeepaLoading] = useState(false);
+  const [historyDailyError, setHistoryDailyError] = useState<string | null>(null);
   const [historyKeepaError, setHistoryKeepaError] = useState<string | null>(null);
   const [historyKeepaRange, setHistoryKeepaRange] = useState<"7d" | "1m" | "3m" | "6m">("3m");
   const [aiInsightSubmitting, setAiInsightSubmitting] = useState(false);
   const [aiInsightJobId, setAiInsightJobId] = useState<string | null>(null);
-  const [historyTab, setHistoryTab] = useState<"month" | "child" | "price" | "keepa">("month");
+  const [historyTab, setHistoryTab] = useState<"month" | "child" | "daily" | "price" | "keepa">("month");
+  const [dailyCompareModalOpen, setDailyCompareModalOpen] = useState(false);
+  const [dailyCompareLoading, setDailyCompareLoading] = useState(false);
+  const [dailyCompareError, setDailyCompareError] = useState<string | null>(null);
+  const [dailyCompareLeftData, setDailyCompareLeftData] = useState<BsrHistoryRow[]>([]);
+  const [dailyCompareRightData, setDailyCompareRightData] = useState<BsrHistoryRow[]>([]);
   const [monthlySalesTrendMap, setMonthlySalesTrendMap] = useState<Record<string, MonthlyTrendPoint[]>>({});
   const monthlySalesTrendMapRef = useRef<Record<string, MonthlyTrendPoint[]>>({});
   const monthlySalesTrendLoadingRef = useRef<Set<string>>(new Set());
+  const monthlySalesTrendQueueRef = useRef<Map<string, { asin: string; site: string }>>(new Map());
+  const monthlySalesTrendFlushTimerRef = useRef<number | null>(null);
+  const [bsrDetailMap, setBsrDetailMap] = useState<Record<string, BsrItem>>({});
+  const bsrDetailMapRef = useRef<Record<string, BsrItem>>({});
+  const [bsrDetailLoadingMap, setBsrDetailLoadingMap] = useState<Record<string, boolean>>({});
+  const bsrDetailLoadingRef = useRef<Set<string>>(new Set());
   const historyChartRef = useRef<HTMLDivElement>(null);
+  const dailyCompareChartRef = useRef<HTMLDivElement>(null);
   const [libraryHover, setLibraryHover] = useState<{
     rect: DOMRect;
     payload: LibraryHoverPayload;
@@ -827,6 +1135,38 @@ export function BsrBoard({
   const dropdownRefs = useRef<Record<FilterKey, HTMLDivElement | null>>(
     {} as Record<FilterKey, HTMLDivElement | null>
   );
+
+  useEffect(() => {
+    let cancelled = false;
+    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+    const refreshEffectiveUser = async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/auth/me`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const userid = String(data?.user?.dingtalk_userid || "").trim();
+        const username = String(data?.user?.dingtalk_username || "").trim();
+        const role = String(data?.user?.role || "").trim().toLowerCase();
+        if (!userid || !username || !["admin", "team_lead", "operator"].includes(role)) {
+          return;
+        }
+        if (!cancelled) {
+          setEffectiveUser({ userid, username, role: role as "admin" | "team_lead" | "operator" });
+        }
+      } catch {
+        // ignore and fallback to cached auth user
+      }
+    };
+    const onDebugActorUpdated = () => {
+      void refreshEffectiveUser();
+    };
+    void refreshEffectiveUser();
+    window.addEventListener("debug_actor_updated", onDebugActorUpdated);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("debug_actor_updated", onDebugActorUpdated);
+    };
+  }, []);
 
   useEffect(() => {
     if (!historyPopover) return;
@@ -844,6 +1184,58 @@ export function BsrBoard({
     const normalizedAsin = String(asin || "").trim().toUpperCase();
     const normalizedSite = String(site || "US").trim().toUpperCase() || "US";
     return `${normalizedSite}|${normalizedAsin}`;
+  }, []);
+
+  const requestBsrDetail = useCallback(async (target: Pick<BsrItem, "asin" | "site" | "createtime" | "brand">) => {
+    const asin = String(target?.asin || "").trim().toUpperCase();
+    if (!asin) return null;
+    const cacheKey = buildBsrDetailCacheKey(target);
+    const cached = bsrDetailMapRef.current[cacheKey];
+    if (cached) {
+      return cached;
+    }
+    if (bsrDetailLoadingRef.current.has(cacheKey)) {
+      return null;
+    }
+
+    bsrDetailLoadingRef.current.add(cacheKey);
+    setBsrDetailLoadingMap((prev) => ({ ...prev, [cacheKey]: true }));
+    try {
+      const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+      const payload: Record<string, unknown> = {
+        asin,
+        site: String(target?.site || "US").trim().toUpperCase() || "US",
+      };
+      if (target?.createtime) {
+        payload.createtime = target.createtime;
+      }
+      if (target?.brand) {
+        payload.brand = target.brand;
+      }
+      const res = await fetch(`${apiBase}/api/bsr/lookup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
+      }
+      const nextItem = data.item && typeof data.item === "object" ? (data.item as BsrItem) : null;
+      if (nextItem) {
+        setBsrDetailMap((prev) => ({ ...prev, [cacheKey]: nextItem }));
+      }
+      return nextItem;
+    } catch {
+      return null;
+    } finally {
+      bsrDetailLoadingRef.current.delete(cacheKey);
+      setBsrDetailLoadingMap((prev) => {
+        const next = { ...prev };
+        delete next[cacheKey];
+        return next;
+      });
+    }
   }, []);
 
   useEffect(() => {
@@ -887,49 +1279,11 @@ export function BsrBoard({
 
   useEffect(() => {
     if (!dateFilter || dateOptions.length === 0) {
-      setPrevDate("");
+      setCompareDate("");
       return;
     }
-    const idx = dateOptions.indexOf(dateFilter);
-    if (idx >= 0 && idx + 1 < dateOptions.length) {
-      setPrevDate(dateOptions[idx + 1]);
-    } else {
-      setPrevDate("");
-    }
+    setCompareDate(resolveDefaultCompareDate(dateFilter, dateOptions));
   }, [dateFilter, dateOptions]);
-
-  useEffect(() => {
-    if (!prevDate) {
-      setPrevItemsMap({});
-      return;
-    }
-    const controller = new AbortController();
-    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-    const payload: Record<string, unknown> = { limit: 2000, createtime: prevDate, site: siteFilter };
-    fetch(`${apiBase}/api/bsr/query`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    })
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json();
-      })
-      .then((data) => {
-        const items = Array.isArray(data.items) ? (data.items as BsrItem[]) : [];
-        const map: Record<string, BsrItem> = {};
-        items.forEach((row) => {
-          if (row?.asin) map[String(row.asin)] = row;
-        });
-        setPrevItemsMap(map);
-      })
-      .catch(() => {
-        setPrevItemsMap({});
-      });
-
-    return () => controller.abort();
-  }, [prevDate, siteFilter]);
 
   const openTagModal = (item: BsrItem) => {
     setTagModalMode("bsr");
@@ -953,7 +1307,7 @@ export function BsrBoard({
   };
 
   const openFieldTagModal = (
-    field: "application_tags" | "tooth_pattern_tags" | "material_tags" | "position_tags"
+    field: "application_tags" | "other_tags" | "material_tags" | "position_tags"
   ) => {
     setActiveFieldTag(field);
     setFieldTagModalOpen(true);
@@ -1051,10 +1405,11 @@ export function BsrBoard({
       sku: product?.sku || "",
       asin: product?.asin || "",
       name: product?.name || product?.product || "",
+      category: String(product?.category || bsr?.category || "").trim(),
       brand: product?.brand || "",
       status: product?.status || "在售",
       application_tags: product?.application_tags || "",
-      tooth_pattern_tags: product?.tooth_pattern_tags || "",
+      other_tags: product?.other_tags || "",
       material_tags: product?.material_tags || "",
       spec_length: product?.spec_length || "",
       spec_quantity: product?.spec_quantity ?? undefined,
@@ -1134,6 +1489,7 @@ export function BsrBoard({
       image_url: productBsrForm.image_url?.trim() || null,
       product_url: productBsrForm.product_url?.trim() || null,
       brand: productFormData.brand?.trim() || null,
+      category: productFormData.category?.trim() || null,
       createtime: productBsrForm.createtime?.trim() || null,
       price: toNumberOrNull(productBsrForm.price),
       list_price: toNumberOrNull(productBsrForm.list_price),
@@ -1165,8 +1521,9 @@ export function BsrBoard({
     sku: String(productFormData.sku || "").trim(),
     brand: String(productFormData.brand || "").trim(),
     product: String(productFormData.name || "").trim(),
+    category: productFormData.category?.trim() || null,
     application_tags: productFormData.application_tags?.trim() || null,
-    tooth_pattern_tags: productFormData.tooth_pattern_tags?.trim() || null,
+    other_tags: productFormData.other_tags?.trim() || null,
     material_tags: productFormData.material_tags?.trim() || null,
     spec_length: productFormData.spec_length?.trim() || null,
     spec_quantity: productFormData.spec_quantity !== undefined && productFormData.spec_quantity !== null
@@ -1187,28 +1544,46 @@ export function BsrBoard({
     bsr: buildProductBsrPayload(),
   });
 
-  const refreshLibraryItems = async () => {
+  const refreshLibraryItems = useCallback(async (options?: { append?: boolean; keyword?: string; offset?: number }) => {
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-    setLibraryLoading(true);
-    setLibraryError(null);
+    const append = !!options?.append;
+    const keyword = String(options?.keyword ?? debouncedSidebarSearch ?? "").trim();
+    const nextOffset = typeof options?.offset === "number" ? options.offset : append ? libraryOffset : 0;
+    if (append) {
+      setLibraryLoadingMore(true);
+    } else {
+      setLibraryLoading(true);
+      setLibraryError(null);
+    }
     try {
       const res = await fetch(`${apiBase}/api/yida-products/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ limit: 200, site: siteFilter }),
+        body: JSON.stringify({ limit: LIBRARY_PAGE_SIZE, offset: nextOffset, q: keyword || undefined }),
       });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
       const data = await res.json();
-      setLibraryItems(Array.isArray(data.items) ? data.items : []);
+      const nextItems = Array.isArray(data.items) ? data.items as ProductLibraryItem[] : [];
+      setLibraryItems((prev) => (append ? [...prev, ...nextItems] : nextItems));
+      setLibraryOffset(nextOffset + nextItems.length);
+      setLibraryHasMore(nextItems.length === LIBRARY_PAGE_SIZE);
     } catch (err) {
-      setLibraryItems([]);
-      setLibraryError("加载产品库失败，请检查后端服务。");
+      if (!append) {
+        setLibraryItems([]);
+        setLibraryOffset(0);
+        setLibraryHasMore(false);
+        setLibraryError("加载产品库失败，请检查后端服务。");
+      }
     } finally {
-      setLibraryLoading(false);
+      if (append) {
+        setLibraryLoadingMore(false);
+      } else {
+        setLibraryLoading(false);
+      }
     }
-  };
+  }, [debouncedSidebarSearch, libraryOffset]);
 
   const reloadDates = async () => {
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
@@ -1241,11 +1616,34 @@ export function BsrBoard({
   const reloadBsrItems = async (targetDate?: string) => {
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
     setLoading(true);
+    setLoadedKey("");
     setError(null);
-    const payload: Record<string, unknown> = { limit: 500, site: siteFilter };
+    setItems([]);
+    const payload: Record<string, unknown> = { limit: 100, site: siteFilter, compact: true };
     const dateValue = targetDate || dateFilter;
     if (dateValue) {
       payload.createtime = dateValue;
+    }
+    if (compareDate) {
+      payload.compare_date = compareDate;
+    }
+    if (filterState.brands.length > 0) {
+      payload.brand_filters = filterState.brands;
+    }
+    if (filterState.ratings.length > 0) {
+      payload.rating_filters = filterState.ratings;
+    }
+    if (filterState.labels.length > 0) {
+      payload.tag_filters = filterState.labels;
+    }
+    if (categoryFilter) {
+      payload.category = categoryFilter;
+    }
+    if (priceMin.trim() !== "") {
+      payload.price_min = Number(priceMin);
+    }
+    if (priceMax.trim() !== "") {
+      payload.price_max = Number(priceMax);
     }
     try {
       const res = await fetch(`${apiBase}/api/bsr/query`, {
@@ -1257,7 +1655,14 @@ export function BsrBoard({
         throw new Error(`HTTP ${res.status}`);
       }
       const data = await res.json();
-      setItems(Array.isArray(data.items) ? data.items : []);
+      const nextItems = Array.isArray(data.items) ? (data.items as BsrItem[]) : [];
+      setItems(nextItems);
+      const prevMap = buildPrevItemsMap(nextItems);
+      setPrevItemsMap(prevMap);
+      const nextLoadedKey = `${String(siteFilter)}|${String(dateValue || dateFilter)}`;
+      setLoadedKey(nextLoadedKey);
+      const cacheKey = buildBsrListCacheKey(siteFilter, String(dateValue || dateFilter), compareDate, bsrFilterSignature);
+      setBsrListCache(cacheKey, nextLoadedKey, nextItems);
     } catch (err) {
       setError("加载 BSR 数据失败，请检查后端服务。");
     } finally {
@@ -1323,118 +1728,6 @@ export function BsrBoard({
     }
   };
 
-  const submitFetchDaily = async () => {
-    if (fetchDailyLoading) return;
-    setFetchDailyLoading(true);
-    try {
-      const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-      const res = await fetch(`${apiBase}/api/bsr/fetch-daily`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ site: siteFilter }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) {
-        const message = data?.error?.message || data?.detail || `HTTP ${res.status}`;
-        throw new Error(message);
-      }
-      const jobId = String(data?.job_id || "").trim();
-      if (!jobId) {
-        throw new Error("抓取任务提交失败：缺少任务ID");
-      }
-      setFetchDailyJobId(jobId);
-      showToast("抓取任务已提交，后台执行中。", "info");
-    } catch (err) {
-      const message = err instanceof Error && err.message ? err.message : "抓取失败，请检查后端服务。";
-      showToast(message, "error");
-      setFetchDailyJobId(null);
-      setFetchDailyLoading(false);
-    }
-  };
-
-  const handleFetchDaily = () => {
-    if (fetchDailyLoading) return;
-    showConfirm(
-      "确认抓取数据",
-      `将按站点 ${siteFilter} 的最新批次开始抓取，是否继续？`,
-      () => {
-        void submitFetchDaily();
-      }
-    );
-  };
-
-  useEffect(() => {
-    if (!fetchDailyJobId) return;
-    let cancelled = false;
-    let failedPollCount = 0;
-    const pollStartedAt = Date.now();
-    let timer: number | null = null;
-    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-    const getNextPollDelay = () => (Date.now() - pollStartedAt < 60_000 ? 3_000 : 8_000);
-    const scheduleNextPoll = () => {
-      if (cancelled) return;
-      timer = window.setTimeout(() => {
-        void poll();
-      }, getNextPollDelay());
-    };
-
-    const poll = async () => {
-      try {
-        const res = await fetch(`${apiBase}/api/bsr/fetch-daily/jobs/${fetchDailyJobId}`);
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok || !data.ok) {
-          const message = data?.error?.message || data?.detail || `HTTP ${res.status}`;
-          throw new Error(message);
-        }
-        failedPollCount = 0;
-        const status = String(data?.status || "").toLowerCase();
-        if (status === "pending" || status === "running") {
-          scheduleNextPoll();
-          return;
-        }
-        if (cancelled) {
-          return;
-        }
-        setFetchDailyJobId(null);
-        setFetchDailyLoading(false);
-        if (status === "success") {
-          showToast("抓取完成", "success");
-          const { nextDate } = await reloadDates();
-          await reloadBsrItems(nextDate);
-          return;
-        }
-        const failMessage = String(data?.error_message || "").trim() || "抓取失败";
-        showToast(failMessage, "error");
-      } catch (err) {
-        if (cancelled) {
-          return;
-        }
-        failedPollCount += 1;
-        if (failedPollCount >= 3) {
-          const message = err instanceof Error && err.message ? err.message : "任务状态查询失败";
-          showToast(message, "error");
-          setFetchDailyJobId(null);
-          setFetchDailyLoading(false);
-          return;
-        }
-        scheduleNextPoll();
-      }
-    };
-
-    void poll();
-    return () => {
-      cancelled = true;
-      if (timer) {
-        window.clearTimeout(timer);
-      }
-    };
-  }, [fetchDailyJobId]);
-
-  useEffect(() => {
-    if (!fetchDailyJobId && fetchDailyLoading) {
-      setFetchDailyLoading(false);
-    }
-  }, [fetchDailyJobId, fetchDailyLoading]);
 
   useEffect(() => {
     if (!aiInsightJobId) return;
@@ -1565,7 +1858,83 @@ export function BsrBoard({
     }
   };
 
-  const loadCardMonthlySalesTrend = useCallback(async (target: Pick<BsrItem, "asin" | "site">) => {
+  const loadHistoryDailyData = async (target: Pick<BsrItem, "asin" | "site">) => {
+    if (!target?.asin) return;
+    setHistoryDailyLoading(true);
+    setHistoryDailyError(null);
+    try {
+      const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+      const site = target.site || "US";
+      const res = await fetch(`${apiBase}/api/bsr/daily`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ asin: target.asin, site }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        const message = data?.error?.message || data?.detail || `HTTP ${res.status}`;
+        throw new Error(message);
+      }
+      const items = Array.isArray(data.items) ? (data.items as BsrHistoryRow[]) : [];
+      setHistoryDailyData(items);
+    } catch (err) {
+      const message = err instanceof Error && err.message ? err.message : "加载日销量数据失败";
+      setHistoryDailyError(message);
+    } finally {
+      setHistoryDailyLoading(false);
+    }
+  };
+
+  const fetchDailyHistoryRows = async (target: Pick<BsrItem, "asin" | "site">): Promise<BsrHistoryRow[]> => {
+    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+    const site = target.site || "US";
+    const res = await fetch(`${apiBase}/api/bsr/daily`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ asin: target.asin, site }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      const message = data?.error?.message || data?.detail || `HTTP ${res.status}`;
+      throw new Error(message);
+    }
+    return Array.isArray(data.items) ? (data.items as BsrHistoryRow[]) : [];
+  };
+
+  const closeDailyCompareModal = () => {
+    setDailyCompareModalOpen(false);
+    setDailyCompareError(null);
+  };
+
+  const openDailyCompareModal = async () => {
+    const leftAsin = String(mappingLeft?.asin || "").trim();
+    const rightAsin = String(compareTargetAsin || mappingRightMeta?.asin || "").trim();
+    const site = String(mappingLeft?.site || siteFilter || "US").trim().toUpperCase() || "US";
+    if (!leftAsin || !rightAsin) {
+      showToast("请先选择完整的对比ASIN。", "info");
+      return;
+    }
+    setDailyCompareModalOpen(true);
+    setDailyCompareLoading(true);
+    setDailyCompareError(null);
+    try {
+      const [leftRows, rightRows] = await Promise.all([
+        fetchDailyHistoryRows({ asin: leftAsin, site }),
+        fetchDailyHistoryRows({ asin: rightAsin, site }),
+      ]);
+      setDailyCompareLeftData(leftRows);
+      setDailyCompareRightData(rightRows);
+    } catch (err) {
+      const message = err instanceof Error && err.message ? err.message : "加载日销量对比数据失败";
+      setDailyCompareError(message);
+      setDailyCompareLeftData([]);
+      setDailyCompareRightData([]);
+    } finally {
+      setDailyCompareLoading(false);
+    }
+  };
+
+  const loadCardMonthlySalesTrend = useCallback((target: Pick<BsrItem, "asin" | "site">) => {
     const asin = String(target?.asin || "").trim().toUpperCase();
     if (!asin) return;
     const site = String(target?.site || "US").trim().toUpperCase() || "US";
@@ -1577,38 +1946,71 @@ export function BsrBoard({
       return;
     }
     monthlySalesTrendLoadingRef.current.add(key);
-    try {
-      const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-      const res = await fetch(`${apiBase}/api/bsr/monthly`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ asin, site, is_child: 0 }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) {
-        throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
-      }
-      const rows = Array.isArray(data.items) ? (data.items as BsrHistoryRow[]) : [];
-      const trendValues = rows
-        .map((row) => {
-          const salesVolume = Number(row?.sales_volume);
-          if (!Number.isFinite(salesVolume) || salesVolume < 0) return null;
-          const salesAmountRaw = Number(row?.sales);
-          const salesAmount = Number.isFinite(salesAmountRaw) ? salesAmountRaw : null;
-          return {
-            month: String(row?.month || ""),
-            salesVolume,
-            salesAmount,
-          } as MonthlyTrendPoint;
-        })
-        .filter(Boolean)
-        .slice(-12) as MonthlyTrendPoint[];
-      setMonthlySalesTrendMap((prev) => ({ ...prev, [key]: trendValues }));
-    } catch {
-      setMonthlySalesTrendMap((prev) => ({ ...prev, [key]: [] }));
-    } finally {
-      monthlySalesTrendLoadingRef.current.delete(key);
+    monthlySalesTrendQueueRef.current.set(key, { asin, site });
+    if (monthlySalesTrendFlushTimerRef.current !== null) {
+      window.clearTimeout(monthlySalesTrendFlushTimerRef.current);
     }
+    monthlySalesTrendFlushTimerRef.current = window.setTimeout(async () => {
+      const queued = Array.from(monthlySalesTrendQueueRef.current.values());
+      monthlySalesTrendQueueRef.current.clear();
+      monthlySalesTrendFlushTimerRef.current = null;
+      if (queued.length === 0) return;
+
+      const groups = queued.reduce((acc, item) => {
+        const group = acc.get(item.site) || [];
+        group.push(item.asin);
+        acc.set(item.site, group);
+        return acc;
+      }, new Map<string, string[]>());
+
+      const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+      const nextTrendMap: Record<string, MonthlyTrendPoint[]> = {};
+      try {
+        await Promise.all(
+          Array.from(groups.entries()).map(async ([groupSite, asins]) => {
+            const uniqueAsins = Array.from(new Set(asins));
+            const res = await fetch(`${apiBase}/api/bsr/monthly/batch`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ asins: uniqueAsins, site: groupSite, is_child: 0 }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) {
+              throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
+            }
+            const items = data.items && typeof data.items === "object" ? data.items as Record<string, BsrHistoryRow[]> : {};
+            uniqueAsins.forEach((asinValue) => {
+              const rows = Array.isArray(items[asinValue]) ? items[asinValue] : [];
+              nextTrendMap[getMonthlyTrendKey(asinValue, groupSite)] = rows
+                .map((row) => {
+                  const salesVolume = Number(row?.sales_volume);
+                  if (!Number.isFinite(salesVolume) || salesVolume < 0) return null;
+                  const salesAmountRaw = Number(row?.sales);
+                  const salesAmount = Number.isFinite(salesAmountRaw) ? salesAmountRaw : null;
+                  return {
+                    month: String(row?.month || ""),
+                    salesVolume,
+                    salesAmount,
+                  } as MonthlyTrendPoint;
+                })
+                .filter(Boolean)
+                .slice(-12) as MonthlyTrendPoint[];
+            });
+          })
+        );
+        setMonthlySalesTrendMap((prev) => ({ ...prev, ...nextTrendMap }));
+      } catch {
+        const emptyMap = queued.reduce((acc, item) => {
+          acc[getMonthlyTrendKey(item.asin, item.site)] = [];
+          return acc;
+        }, {} as Record<string, MonthlyTrendPoint[]>);
+        setMonthlySalesTrendMap((prev) => ({ ...prev, ...emptyMap }));
+      } finally {
+        queued.forEach((item) => {
+          monthlySalesTrendLoadingRef.current.delete(getMonthlyTrendKey(item.asin, item.site));
+        });
+      }
+    }, 60);
   }, [getMonthlyTrendKey]);
 
   useEffect(() => {
@@ -1616,10 +2018,28 @@ export function BsrBoard({
   }, [monthlySalesTrendMap]);
 
   useEffect(() => {
+    bsrDetailMapRef.current = bsrDetailMap;
+  }, [bsrDetailMap]);
+
+  useEffect(() => {
     setMonthlySalesTrendMap({});
     monthlySalesTrendMapRef.current = {};
     monthlySalesTrendLoadingRef.current.clear();
+    monthlySalesTrendQueueRef.current.clear();
+    if (monthlySalesTrendFlushTimerRef.current !== null) {
+      window.clearTimeout(monthlySalesTrendFlushTimerRef.current);
+      monthlySalesTrendFlushTimerRef.current = null;
+    }
   }, [siteFilter]);
+
+  useEffect(() => {
+    return () => {
+      if (monthlySalesTrendFlushTimerRef.current !== null) {
+        window.clearTimeout(monthlySalesTrendFlushTimerRef.current);
+        monthlySalesTrendFlushTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const resolveKeepaRangeDays = (range: "7d" | "1m" | "3m" | "6m") => {
     if (range === "7d") return 7;
@@ -1699,7 +2119,27 @@ export function BsrBoard({
       .map(({ __ts, ...rest }) => rest);
   }, [historyKeepaData, historyKeepaRange]);
 
-  const openHistoryPopover = (target: BsrItem, initialTab: "month" | "child" | "price" | "keepa" = "month") => {
+  const historyDailyFilteredData = useMemo(() => {
+    if (!historyDailyData.length) return [];
+    const parsed = historyDailyData
+      .map((item) => {
+        const raw = String(item?.date || "").trim();
+        if (!raw) return null;
+        const ts = new Date(raw).getTime();
+        if (!Number.isFinite(ts)) return null;
+        return { ...item, __ts: ts };
+      })
+      .filter(Boolean) as Array<BsrHistoryRow & { __ts: number }>;
+    if (!parsed.length) return [];
+    const latestTs = parsed.reduce((acc, cur) => (cur.__ts > acc ? cur.__ts : acc), parsed[0].__ts);
+    const fromTs = latestTs - (30 - 1) * 24 * 60 * 60 * 1000;
+    return parsed
+      .filter((item) => item.__ts >= fromTs)
+      .sort((a, b) => a.__ts - b.__ts)
+      .map(({ __ts, ...rest }) => rest);
+  }, [historyDailyData]);
+
+  const openHistoryPopover = (target: BsrItem, initialTab: "month" | "child" | "daily" | "price" | "keepa" = "month") => {
     if (historyPopover?.asin === target?.asin) {
       setHistoryTab(initialTab);
       if (initialTab === "child" && historyChildData.length === 0 && !historyChildLoading) {
@@ -1707,6 +2147,9 @@ export function BsrBoard({
       }
       if ((initialTab === "month" || initialTab === "price") && historyMonthData.length === 0 && !historyMonthLoading) {
         loadHistoryData(historyPopover);
+      }
+      if (initialTab === "daily" && historyDailyData.length === 0 && !historyDailyLoading) {
+        loadHistoryDailyData(historyPopover);
       }
       if (initialTab === "keepa" && historyKeepaData.length === 0 && !historyKeepaLoading) {
         loadHistoryKeepaData(historyPopover);
@@ -1717,16 +2160,21 @@ export function BsrBoard({
     setHistoryPopover({ asin: target?.asin, site: target?.site || "US" });
     setHistoryMonthData([]);
     setHistoryChildData([]);
+    setHistoryDailyData([]);
     setHistoryKeepaData([]);
     setHistoryMonthError(null);
     setHistoryChildError(null);
+    setHistoryDailyError(null);
     setHistoryKeepaError(null);
     setHistoryKeepaRange("3m");
     setHistoryMonthLoading(false);
     setHistoryChildLoading(false);
+    setHistoryDailyLoading(false);
     setHistoryKeepaLoading(false);
     if (initialTab === "child") {
       loadHistoryData(target, { isChild: true });
+    } else if (initialTab === "daily") {
+      loadHistoryDailyData(target);
     } else if (initialTab === "keepa") {
       loadHistoryKeepaData(target);
     } else {
@@ -1738,17 +2186,20 @@ export function BsrBoard({
     setHistoryPopover(null);
     setHistoryMonthData([]);
     setHistoryChildData([]);
+    setHistoryDailyData([]);
     setHistoryKeepaData([]);
     setHistoryMonthError(null);
     setHistoryChildError(null);
+    setHistoryDailyError(null);
     setHistoryKeepaError(null);
     setHistoryKeepaRange("3m");
     setHistoryMonthLoading(false);
     setHistoryChildLoading(false);
+    setHistoryDailyLoading(false);
     setHistoryKeepaLoading(false);
   };
 
-  const handleHistoryTabChange = (tab: "month" | "child" | "price" | "keepa") => {
+  const handleHistoryTabChange = (tab: "month" | "child" | "daily" | "price" | "keepa") => {
     setHistoryTab(tab);
     if (!historyPopover) return;
     if (tab === "child" && historyChildData.length === 0 && !historyChildLoading) {
@@ -1760,6 +2211,9 @@ export function BsrBoard({
     if (tab === "month" && historyMonthData.length === 0 && !historyMonthLoading) {
       loadHistoryData(historyPopover);
     }
+    if (tab === "daily" && historyDailyData.length === 0 && !historyDailyLoading) {
+      loadHistoryDailyData(historyPopover);
+    }
     if (tab === "keepa" && historyKeepaData.length === 0 && !historyKeepaLoading) {
       loadHistoryKeepaData(historyPopover);
     }
@@ -1769,17 +2223,20 @@ export function BsrBoard({
     const activeData =
       historyTab === "child"
         ? historyChildData
-        : historyTab === "keepa"
-          ? historyKeepaFilteredData
-          : historyMonthData;
+        : historyTab === "daily"
+          ? historyDailyFilteredData
+          : historyTab === "keepa"
+            ? historyKeepaFilteredData
+            : historyMonthData;
     if (!historyPopover || !historyChartRef.current) return;
     if (activeData.length === 0) return;
     const chart = echarts.init(historyChartRef.current);
-    const months = activeData.map((d) => d.month);
+    const labels = historyTab === "daily" ? activeData.map((d) => d.date) : activeData.map((d) => d.month);
     const volumes = activeData.map((d) => (d.sales_volume ?? 0));
     const sales = activeData.map((d) => (d.sales ?? 0));
     const prices = activeData.map((d) => (d.price ?? 0));
     const isPriceTab = historyTab === "price";
+    const isDailyTab = historyTab === "daily";
     const isKeepaTab = historyTab === "keepa";
     const keepaDates = activeData.map((d) => d.date);
     const keepaBuyboxPrice = activeData.map((d) => Number(d.buybox_price ?? 0));
@@ -1829,7 +2286,7 @@ export function BsrBoard({
             const formatValue = (name: string, val: unknown) => {
               const num = Number(val);
               if (!Number.isFinite(num)) return "-";
-              if (name.includes("价格")) return `$${num.toFixed(2)}`;
+              if (name.includes("价格")) return `${getCurrencySymbol(historyPopover?.site || siteFilter)}${num.toFixed(2)}`;
               if (name.includes("BSR")) return `#${Math.round(num).toLocaleString()}`;
               return num.toLocaleString();
             };
@@ -1864,7 +2321,9 @@ export function BsrBoard({
           ? ["Buybox价格", "价格", "Prime价格", "Coupon价格", "子体销量", "大类BSR", "小类BSR"]
           : isPriceTab
             ? ["价格"]
-            : ["月销量", "月销售额"],
+            : isDailyTab
+              ? ["日销量"]
+              : ["月销量", "月销售额"],
         top: 0,
         orient: "horizontal",
         left: isKeepaTab ? 10 : "center",
@@ -1873,7 +2332,7 @@ export function BsrBoard({
       },
       xAxis: {
         type: "category",
-        data: isKeepaTab ? keepaDates : months,
+        data: isKeepaTab ? keepaDates : labels,
         axisLine: { lineStyle: { color: "#E5E7EB" } },
         axisTick: { show: false },
         axisLabel: {
@@ -1889,7 +2348,7 @@ export function BsrBoard({
         ? [
           {
             type: "value",
-            name: "价格($)",
+            name: `价格(${getCurrencySymbol(historyPopover?.site || siteFilter)})`,
             nameTextStyle: { color: "#6B7280", fontWeight: 600 },
             axisLine: { show: false },
             axisTick: { show: false },
@@ -1911,34 +2370,45 @@ export function BsrBoard({
           },
         ]
         : isPriceTab
-        ? [
-          {
-            type: "value",
-            name: "",
-            axisLine: { show: false },
-            axisTick: { show: false },
-            splitLine: { lineStyle: { color: "#E5E7EB", type: "dashed" } },
-            axisLabel: { color: "#F59E0B", fontWeight: 600 },
-          },
-        ]
-        : [
-          {
-            type: "value",
-            name: "",
-            axisLine: { show: false },
-            axisTick: { show: false },
-            splitLine: { show: false },
-            axisLabel: { color: "#F59E0B", fontWeight: 600 },
-          },
-          {
-            type: "value",
-            name: "",
-            axisLine: { show: false },
-            axisTick: { show: false },
-            splitLine: { show: false },
-            axisLabel: { color: "#22C55E", fontWeight: 600 },
-          },
-        ],
+          ? [
+            {
+              type: "value",
+              name: "",
+              axisLine: { show: false },
+              axisTick: { show: false },
+              splitLine: { lineStyle: { color: "#E5E7EB", type: "dashed" } },
+              axisLabel: { color: "#F59E0B", fontWeight: 600 },
+            },
+          ]
+          : isDailyTab
+            ? [
+              {
+                type: "value",
+                name: "",
+                axisLine: { show: false },
+                axisTick: { show: false },
+                splitLine: { show: false },
+                axisLabel: { color: "#F59E0B", fontWeight: 600 },
+              },
+            ]
+            : [
+              {
+                type: "value",
+                name: "",
+                axisLine: { show: false },
+                axisTick: { show: false },
+                splitLine: { show: false },
+                axisLabel: { color: "#F59E0B", fontWeight: 600 },
+              },
+              {
+                type: "value",
+                name: "",
+                axisLine: { show: false },
+                axisTick: { show: false },
+                splitLine: { show: false },
+                axisLabel: { color: "#22C55E", fontWeight: 600 },
+              },
+            ],
       series: isKeepaTab
         ? [
           {
@@ -2034,39 +2504,50 @@ export function BsrBoard({
           },
         ]
         : isPriceTab
-        ? [
-          {
-            name: "价格",
-            type: "line",
-            data: prices,
-            smooth: false,
-            step: "end",
-            lineStyle: { color: "#F59E0B", width: 2 },
-            itemStyle: { color: "#F59E0B" },
-            symbol: "none",
-          },
-        ]
-        : [
-          {
-            name: "月销量",
-            type: "bar",
-            data: volumes,
-            itemStyle: { color: "#F59E0B" },
-            barWidth: 8,
-            barCategoryGap: "65%",
-          },
-          {
-            name: "月销售额",
-            type: "line",
-            yAxisIndex: 1,
-            data: sales,
-            smooth: true,
-            lineStyle: { color: "#22C55E", width: 2 },
-            itemStyle: { color: "#FFFFFF", borderColor: "#22C55E", borderWidth: 2 },
-            symbol: "circle",
-            symbolSize: 7,
-          },
-        ],
+          ? [
+            {
+              name: "价格",
+              type: "line",
+              data: prices,
+              smooth: false,
+              step: "end",
+              lineStyle: { color: "#F59E0B", width: 2 },
+              itemStyle: { color: "#F59E0B" },
+              symbol: "none",
+            },
+          ]
+          : isDailyTab
+            ? [
+              {
+                name: "日销量",
+                type: "bar",
+                data: volumes,
+                itemStyle: { color: "#F59E0B" },
+                barWidth: 8,
+                barCategoryGap: "65%",
+              },
+            ]
+            : [
+              {
+                name: "月销量",
+                type: "bar",
+                data: volumes,
+                itemStyle: { color: "#F59E0B" },
+                barWidth: 8,
+                barCategoryGap: "65%",
+              },
+              {
+                name: "月销售额",
+                type: "line",
+                yAxisIndex: 1,
+                data: sales,
+                smooth: true,
+                lineStyle: { color: "#22C55E", width: 2 },
+                itemStyle: { color: "#FFFFFF", borderColor: "#22C55E", borderWidth: 2 },
+                symbol: "circle",
+                symbolSize: 7,
+              },
+            ],
     });
 
     const handleResize = () => chart.resize();
@@ -2075,14 +2556,136 @@ export function BsrBoard({
       window.removeEventListener("resize", handleResize);
       chart.dispose();
     };
-  }, [historyPopover, historyMonthData, historyChildData, historyKeepaFilteredData, historyTab]);
+  }, [historyPopover, historyMonthData, historyChildData, historyDailyFilteredData, historyKeepaFilteredData, historyTab]);
+
+  useEffect(() => {
+    if (!dailyCompareModalOpen || !dailyCompareChartRef.current) return;
+    if (dailyCompareLoading || dailyCompareError) return;
+
+    const leftAsin = String(mappingLeft?.asin || "").trim();
+    const rightAsin = String(compareTargetAsin || mappingRightMeta?.asin || "").trim();
+    const leftMap = new Map<string, number>();
+    const rightMap = new Map<string, number>();
+
+    dailyCompareLeftData.forEach((row) => {
+      const date = String(row?.date || "").trim();
+      const vol = Number(row?.sales_volume);
+      if (!date || !Number.isFinite(vol)) return;
+      leftMap.set(date, vol);
+    });
+    dailyCompareRightData.forEach((row) => {
+      const date = String(row?.date || "").trim();
+      const vol = Number(row?.sales_volume);
+      if (!date || !Number.isFinite(vol)) return;
+      rightMap.set(date, vol);
+    });
+
+    const allLabels = Array.from(new Set([...leftMap.keys(), ...rightMap.keys()])).sort((a, b) => a.localeCompare(b));
+    if (allLabels.length === 0) return;
+    const latestTs = Date.parse(`${allLabels[allLabels.length - 1]}T00:00:00Z`);
+    const fromTs = Number.isFinite(latestTs) ? latestTs - 29 * 24 * 60 * 60 * 1000 : null;
+    const labels = allLabels.filter((date) => {
+      if (fromTs === null) return false;
+      const ts = Date.parse(`${date}T00:00:00Z`);
+      return Number.isFinite(ts) && ts >= fromTs;
+    });
+    if (labels.length === 0) return;
+
+    const leftSeries = labels.map((date) => (leftMap.has(date) ? leftMap.get(date) : null));
+    const rightSeries = labels.map((date) => (rightMap.has(date) ? rightMap.get(date) : null));
+
+    const chart = echarts.init(dailyCompareChartRef.current);
+    chart.setOption({
+      grid: { left: 56, right: 48, top: 56, bottom: 64 },
+      tooltip: { trigger: "axis" },
+      legend: {
+        top: 10,
+        data: [leftAsin || "ASIN A", rightAsin || "ASIN B"],
+        textStyle: { color: "#6B7280" },
+      },
+      xAxis: {
+        type: "category",
+        data: labels,
+        axisLine: { lineStyle: { color: "#E5E7EB" } },
+        axisTick: { show: false },
+        axisLabel: { color: "#94A3B8", rotate: 45, margin: 12, fontSize: 11 },
+      },
+      yAxis: {
+        type: "value",
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { color: "#E5E7EB", type: "dashed" } },
+        axisLabel: { color: "#6B7280", fontWeight: 600 },
+      },
+      series: [
+        {
+          name: leftAsin || "ASIN A",
+          type: "line",
+          data: leftSeries,
+          smooth: false,
+          connectNulls: false,
+          lineStyle: { color: "#F59E0B", width: 2.2 },
+          itemStyle: { color: "#FFFFFF", borderColor: "#F59E0B", borderWidth: 2 },
+          symbol: "circle",
+          symbolSize: 6,
+          showSymbol: false,
+        },
+        {
+          name: rightAsin || "ASIN B",
+          type: "line",
+          data: rightSeries,
+          smooth: false,
+          connectNulls: false,
+          lineStyle: { color: "#22C55E", width: 2.2 },
+          itemStyle: { color: "#FFFFFF", borderColor: "#22C55E", borderWidth: 2 },
+          symbol: "circle",
+          symbolSize: 6,
+          showSymbol: false,
+        },
+      ],
+    });
+
+    const handleResize = () => chart.resize();
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      chart.dispose();
+    };
+  }, [
+    dailyCompareModalOpen,
+    dailyCompareLoading,
+    dailyCompareError,
+    dailyCompareLeftData,
+    dailyCompareRightData,
+    mappingLeft?.asin,
+    compareTargetAsin,
+    mappingRightMeta?.asin,
+  ]);
 
   const activeHistoryData =
-    historyTab === "child" ? historyChildData : historyTab === "keepa" ? historyKeepaFilteredData : historyMonthData;
+    historyTab === "child"
+      ? historyChildData
+      : historyTab === "daily"
+        ? historyDailyFilteredData
+        : historyTab === "keepa"
+          ? historyKeepaFilteredData
+          : historyMonthData;
   const activeHistoryLoading =
-    historyTab === "child" ? historyChildLoading : historyTab === "keepa" ? historyKeepaLoading : historyMonthLoading;
+    historyTab === "child"
+      ? historyChildLoading
+      : historyTab === "daily"
+        ? historyDailyLoading
+        : historyTab === "keepa"
+          ? historyKeepaLoading
+          : historyMonthLoading;
   const activeHistoryError =
-    historyTab === "child" ? historyChildError : historyTab === "keepa" ? historyKeepaError : historyMonthError;
+    historyTab === "child"
+      ? historyChildError
+      : historyTab === "daily"
+        ? historyDailyError
+        : historyTab === "keepa"
+          ? historyKeepaError
+          : historyMonthError;
 
   const saveProductModal = async () => {
     const asin = String(productFormData.asin || "").trim();
@@ -2122,19 +2725,59 @@ export function BsrBoard({
     {} as Record<SidebarFilterKey, HTMLDivElement | null>
   );
 
+  useLayoutEffect(() => {
+    setLoadedKey("");
+  }, [dateFilter, siteFilter, compareDate, bsrFilterSignature]);
+
+  useLayoutEffect(() => {
+    setDateLoaded(false);
+  }, [siteFilter]);
+
   useEffect(() => {
     const controller = new AbortController();
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
     if (!dateLoaded) {
       return () => controller.abort();
     }
-    setLoading(true);
+    const normalizedDate = String(dateFilter || "").trim();
+    const normalizedCompareDate = String(compareDate || "").trim();
+    const cacheKey = buildBsrListCacheKey(siteFilter, normalizedDate, normalizedCompareDate, bsrFilterSignature);
+    const cached = bsrListCache.get(cacheKey);
+    const hasFreshCache = !!cached && cached.expiresAt > Date.now();
+    if (hasFreshCache && cached) {
+      setItems(cached.items);
+      setPrevItemsMap(cached.prevMap);
+      setLoadedKey(cached.loadedKey);
+    }
+
+    setLoading(!hasFreshCache);
     setError(null);
-    const payload: Record<string, unknown> = { limit: 500 };
+    const payload: Record<string, unknown> = { limit: 100, compact: true };
     if (dateFilter) {
       payload.createtime = dateFilter;
     }
+    if (compareDate) {
+      payload.compare_date = compareDate;
+    }
     payload.site = siteFilter;
+    if (activeBrands.length > 0) {
+      payload.brand_filters = activeBrands;
+    }
+    if (activeRatings.length > 0) {
+      payload.rating_filters = activeRatings;
+    }
+    if (activeLabels.length > 0) {
+      payload.tag_filters = activeLabels;
+    }
+    if (categoryFilter) {
+      payload.category = categoryFilter;
+    }
+    if (normalizedPriceMin !== "") {
+      payload.price_min = Number(normalizedPriceMin);
+    }
+    if (normalizedPriceMax !== "") {
+      payload.price_max = Number(normalizedPriceMax);
+    }
     logApi("load bsr list", `${apiBase}/api/bsr/query`, payload);
     fetch(`${apiBase}/api/bsr/query`, {
       method: "POST",
@@ -2150,12 +2793,21 @@ export function BsrBoard({
         return res.json();
       })
       .then((data) => {
-        setItems(Array.isArray(data.items) ? data.items : []);
+        const nextItems = Array.isArray(data.items) ? (data.items as BsrItem[]) : [];
+        setItems(nextItems);
+        const prevMap = buildPrevItemsMap(nextItems);
+        setPrevItemsMap(prevMap);
+        const nextLoadedKey = `${String(siteFilter)}|${String(dateFilter)}`;
+        setLoadedKey(nextLoadedKey);
+        setBsrListCache(cacheKey, nextLoadedKey, nextItems);
       })
       .catch((err) => {
         if (err.name !== "AbortError") {
           logApi("bsr query error", err);
-          setError("加载 BSR 数据失败，请检查后端服务。");
+          if (!hasFreshCache) {
+            setError("加载 BSR 数据失败，请检查后端服务。");
+            setPrevItemsMap({});
+          }
         }
       })
       .finally(() => {
@@ -2163,45 +2815,26 @@ export function BsrBoard({
       });
 
     return () => controller.abort();
-  }, [dateFilter, dateOptions.length, siteFilter]);
+  }, [
+    activeBrands,
+    activeLabels,
+    activeRatings,
+    bsrFilterSignature,
+    categoryFilter,
+    compareDate,
+    dateFilter,
+    dateOptions.length,
+    normalizedPriceMax,
+    normalizedPriceMin,
+    siteFilter,
+  ]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-    setLibraryLoading(true);
-    setLibraryError(null);
-    fetch(`${apiBase}/api/yida-products/query`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ limit: 200, site: siteFilter }),
-      signal: controller.signal,
-    })
-      .then((res) => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        return res.json();
-      })
-      .then((data) => {
-        setLibraryItems(Array.isArray(data.items) ? data.items : []);
-      })
-      .catch((err) => {
-        if (err.name !== "AbortError") {
-          console.warn("Failed to load product library:", err);
-          setLibraryItems([]);
-          setLibraryError(null);
-        }
-      })
-      .finally(() => {
-        setLibraryLoading(false);
-      });
-
-    return () => controller.abort();
-  }, [siteFilter]);
-
-  const activeBrands = filterState.brands;
-  const activeRatings = filterState.ratings;
-  const activeLabels = filterState.labels;
+    if (!libraryLoadEnabled) {
+      return;
+    }
+    void refreshLibraryItems({ append: false, keyword: debouncedSidebarSearch, offset: 0 });
+  }, [debouncedSidebarSearch, libraryLoadEnabled, refreshLibraryItems]);
 
   const selectFilter = (key: FilterKey, value: string) => {
     const pluralKey = `${key}s` as keyof typeof filterState;
@@ -2242,6 +2875,9 @@ export function BsrBoard({
     setMappingLeft(null);
     setMappingRight(null);
     setMappingRightMeta(null);
+    setCompareTargetAsin("");
+    setCompareTypeFilter("自家");
+    setCompareBrandFilter("全部");
     setMappingError(null);
     setStrategyOpen(false);
     setSelectedStrategy(null);
@@ -2268,7 +2904,7 @@ export function BsrBoard({
 
   const formatValue = (type: string, value: unknown) => {
     if (value === null || value === undefined) return "-";
-    if (type === "currency") return `$${Number(value).toFixed(2)}`;
+    if (type === "currency") return `${getCurrencySymbol(compareLeft?.site || compareRight?.site || siteFilter)}${Number(value).toFixed(2)}`;
     if (type === "percent") return `${(Number(value) * 100).toFixed(2)}%`;
     if (type === "rank") return `#${Number(value).toLocaleString()}`;
     if (type === "int") return Number(value).toLocaleString();
@@ -2290,12 +2926,15 @@ export function BsrBoard({
       { key: "ad_traffic_count", label: "7天广告流量占比", type: "int", better: "higher", left: parseNumber(left?.ad_traffic_count), right: parseNumber(right?.ad_traffic_count) },
       { key: "launch_date", label: "上架时间", type: "date", better: "earlier", left: left?.launch_date || null, right: right?.launch_date || null },
       { key: "variation_count", label: "变体数", type: "int", better: "higher", left: parseNumber(left?.variation_count), right: parseNumber(right?.variation_count) },
+      { key: "daily_sales_compare", label: "日销量", type: "action", better: "higher", left: null, right: null },
     ];
 
     return rows.map((row) => {
       let diffText = "-";
       let diffClass = "text-gray-400";
-      if (row.type === "date") {
+      if (row.type === "action") {
+        diffText = "";
+      } else if (row.type === "date") {
         const leftDate = parseDate(row.left);
         const rightDate = parseDate(row.right);
         if (leftDate && rightDate) {
@@ -2361,6 +3000,18 @@ export function BsrBoard({
     setMappingModalOpen(true);
   };
 
+  const openMappingDialog = (item: BsrItem) => {
+    setMappingLeft(item);
+    setMappingRight(null);
+    setMappingRightMeta(null);
+    setCompareTargetAsin("");
+    setCompareTypeFilter("自家");
+    setCompareBrandFilter("全部");
+    setMappingError(null);
+    setStrategyOpen(false);
+    setMappingModalOpen(true);
+  };
+
   const strategyOwners = useMemo(() => {
     const set = new Set<string>();
     strategyTasks.forEach((task) => task.owner && set.add(task.owner));
@@ -2368,9 +3019,33 @@ export function BsrBoard({
   }, [strategyTasks]);
 
   const strategyOwnerSelectOptions = useMemo<SelectOption[]>(() => {
-    const placeholder = strategyOwnerLoading ? "加载中..." : "选择团队成员";
-    return [{ value: "", label: placeholder }, ...strategyOwnerOptions];
-  }, [strategyOwnerOptions, strategyOwnerLoading]);
+    return strategyOwnerOptions;
+  }, [strategyOwnerOptions]);
+  const strategyParticipantOptions = useMemo<SelectOption[]>(() => {
+    const options = [...strategyOwnerOptions];
+    if (currentUserId && !options.some((opt) => opt.value === currentUserId)) {
+      options.push({
+        value: currentUserId,
+        label: currentUserName || currentUserId,
+      });
+    }
+    return options;
+  }, [strategyOwnerOptions, currentUserId, currentUserName]);
+
+  const todayReviewDate = useMemo(() => formatDateYmd(new Date()), []);
+  const tomorrowReviewDate = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return formatDateYmd(d);
+  }, []);
+  const deadlineHourOptions = useMemo(
+    () => Array.from({ length: 24 }, (_, hour) => String(hour).padStart(2, "0")),
+    []
+  );
+  const deadlineMinuteOptions = useMemo(
+    () => Array.from({ length: 60 }, (_, minute) => String(minute).padStart(2, "0")),
+    []
+  );
 
   const strategyBrands = useMemo(() => {
     const set = new Set<string>();
@@ -2401,39 +3076,26 @@ export function BsrBoard({
     "已完成": "bg-green-500 text-white",
     "搁置": "bg-yellow-200 text-yellow-700",
   };
-
-  const activeStrategyAsin = compareTargetAsin || mappingRightMeta?.asin || "";
-
   const filteredStrategyTasks = useMemo(() => {
+    const selectedTopAsin = String(compareTargetAsin || "").trim();
     return strategyTasks.filter((task) => {
       const ownerOk = strategyFilters.owner === "全部" || task.owner === strategyFilters.owner;
       const brandOk = strategyFilters.brand === "全部" || task.brand === strategyFilters.brand;
       const priorityOk = strategyFilters.priority === "全部" || task.priority === strategyFilters.priority;
       const statusOk = strategyFilters.status === "全部" || task.state === strategyFilters.status;
-      const asinOk = !activeStrategyAsin || task.yida_asin === activeStrategyAsin;
-      return ownerOk && brandOk && priorityOk && statusOk && asinOk;
+      const topBrandOk = compareBrandFilter === "全部" || task.brand === compareBrandFilter;
+      const taskCompetitorAsin = String(task["competitor_asin"] ?? "").trim();
+      const topTypeAsinOk = !selectedTopAsin
+        ? true
+        : compareTypeFilter === "自家"
+          ? task.yida_asin === selectedTopAsin
+          : taskCompetitorAsin === selectedTopAsin;
+      return ownerOk && brandOk && priorityOk && statusOk && topBrandOk && topTypeAsinOk;
     });
-  }, [strategyTasks, strategyFilters, activeStrategyAsin]);
-
-  const compareOptions = useMemo(() => {
-    const mappedAsins = splitAsins(mappingLeft?.yida_asin);
-    const baseList = mappedAsins.length > 0 ? mappedAsins : libraryItems.map((p) => p.asin);
-    const selectedAsin = compareTargetAsin || mappingRightMeta?.asin || "";
-    if (selectedAsin && !baseList.includes(selectedAsin)) {
-      baseList.unshift(selectedAsin);
-    }
-    const uniqueList = Array.from(new Set(baseList));
-    return uniqueList.map((asin) => {
-      const meta = libraryItems.find((p) => p.asin === asin);
-      return {
-        asin,
-        name: meta?.product || meta?.name || asin,
-      };
-    });
-  }, [mappingLeft?.yida_asin, libraryItems, compareTargetAsin, mappingRightMeta?.asin]);
+  }, [strategyTasks, strategyFilters, compareBrandFilter, compareTypeFilter, compareTargetAsin]);
 
   const strategyGridTemplate =
-    "minmax(180px,1.6fr) 110px 90px 90px 80px 110px 96px 64px";
+    "minmax(180px,1.3fr) minmax(220px,1.8fr) 90px 90px 80px 110px 96px 64px";
 
   const handleMapClick = async (item: BsrItem) => {
     if (!selectedLibraryItem) {
@@ -2523,24 +3185,17 @@ export function BsrBoard({
       }
       return;
     }
-    if (!selectedLibraryItem) {
-      showToast("请先在产品库中选择产品。", "error");
-      return;
-    }
-    setMappingLoading(true);
-    setMappingError(null);
-    try {
-      await openMappingCompare(item, selectedLibraryItem.asin, selectedLibraryItem);
-    } catch (err) {
-      setMappingError("获取对比数据失败，请检查后端服务。");
-      showToast("获取对比数据失败，请检查后端服务。", "error");
-    } finally {
-      setMappingLoading(false);
-    }
+    openMappingDialog(item);
   };
 
   const handleCompareSelect = async (asin: string) => {
     if (!mappingLeft || !asin) return;
+    const selected = compareOptions.find(
+      (opt) => String(opt.asin || "").trim().toUpperCase() === String(asin || "").trim().toUpperCase()
+    );
+    const nextBrand = String(selected?.brand || "").trim() || "全部";
+    setCompareBrandFilter(nextBrand);
+    setCompareTargetAsin(asin);
     setMappingLoading(true);
     setMappingError(null);
     try {
@@ -2557,34 +3212,53 @@ export function BsrBoard({
     }
   };
 
-  const handleCancelMapping = async () => {
+  const handleToggleMapping = async () => {
     if (!mappingLeft) return;
-    const existingAsins = splitAsins(mappingLeft.yida_asin);
-    const targetAsin =
-      compareTargetAsin || mappingRightMeta?.asin || existingAsins[0] || "";
+    const targetAsin = String(compareTargetAsin || mappingRightMeta?.asin || "").trim();
+    const competitorAsin = String(mappingLeft.asin || "").trim();
+    const normalizedTargetAsin = targetAsin.toUpperCase();
     if (!targetAsin) {
-      showToast("暂无可取消的映射ASIN。", "info");
+      showToast("请先选择对比ASIN。", "info");
       return;
     }
-    if (!existingAsins.includes(targetAsin)) {
-      showToast("该ASIN未在映射列表中。", "info");
+    if (targetAsin.toLowerCase() === competitorAsin.toLowerCase()) {
+      showToast("不能映射相同 ASIN。", "info");
       return;
     }
-    const remainingAsins = existingAsins.filter((asin) => asin !== targetAsin);
-    const updatedAsinValue = remainingAsins.join(",");
+
+    const existingAsins = splitAsins(mappingLeft.yida_asin);
+    const existingAsinSet = new Set(existingAsins.map((asin) => asin.toUpperCase()));
+    const isMapped = existingAsinSet.has(normalizedTargetAsin);
+    const isLibraryAsin = libraryItems.some(
+      (item) => String(item?.asin || "").trim().toUpperCase() === normalizedTargetAsin
+    );
+    if (!isMapped && !isLibraryAsin) {
+      showToast("仅可映射产品库中的 ASIN。", "info");
+      return;
+    }
+
+    const nextAsins = isMapped
+      ? existingAsins.filter((asin) => asin.toUpperCase() !== normalizedTargetAsin)
+      : Array.from(new Set([...existingAsins, targetAsin]));
+    const updatedAsinValue = nextAsins.join(",");
+    const payload = {
+      yida_asin: nextAsins.length > 0 ? updatedAsinValue : null,
+      createtime: mappingLeft.createtime || dateFilter || null,
+      site: mappingLeft.site || siteFilter,
+    };
+
     showConfirm(
-      "确认取消映射",
-      `ASIN ${mappingLeft.asin} → 取消映射，自家ASIN：${targetAsin}`,
+      isMapped ? "确认取消映射" : existingAsins.length > 0 ? "确认追加映射" : "确认映射",
+      isMapped
+        ? `ASIN ${mappingLeft.asin} → 取消映射，自家ASIN：${targetAsin}`
+        : existingAsins.length > 0
+          ? `ASIN ${mappingLeft.asin} → 追加映射 ${targetAsin}`
+          : `ASIN ${mappingLeft.asin} → ASIN ${targetAsin}`,
       async () => {
         setMappingActionLoading(true);
         setMappingError(null);
         try {
           const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-          const payload = {
-            yida_asin: remainingAsins.length > 0 ? updatedAsinValue : null,
-            createtime: mappingLeft.createtime || dateFilter || null,
-            site: mappingLeft.site || siteFilter,
-          };
           const res = await fetch(`${apiBase}/api/bsr/${mappingLeft.asin}/mapping`, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -2596,32 +3270,16 @@ export function BsrBoard({
           setItems((prev) =>
             prev.map((item) => {
               const sameAsin = item.asin === mappingLeft.asin;
-              const sameTime =
-                !payload.createtime || item.createtime === payload.createtime;
+              const sameTime = !payload.createtime || item.createtime === payload.createtime;
               if (!sameAsin || !sameTime) return item;
               return { ...item, yida_asin: updatedAsinValue };
             })
           );
-          const updatedLeft = { ...mappingLeft, yida_asin: updatedAsinValue };
-          setMappingLeft(updatedLeft);
-          if (remainingAsins.length > 0) {
-            const nextAsin = remainingAsins[0];
-            const meta = libraryItems.find((p) => p.asin === nextAsin) || {
-              asin: nextAsin,
-              product: "-",
-            };
-            setCompareTargetAsin(nextAsin);
-            setMappingRightMeta(meta);
-            await openMappingCompare(updatedLeft, nextAsin, meta);
-          } else {
-            setCompareTargetAsin("");
-            setMappingRight(null);
-            setMappingRightMeta(null);
-          }
-          showToast("已取消映射。");
+          setMappingLeft((prev) => (prev ? { ...prev, yida_asin: updatedAsinValue } : prev));
+          showToast(isMapped ? "已取消映射。" : "映射成功。");
         } catch (err) {
-          setMappingError("取消映射失败，请检查后端服务。");
-          showToast("取消映射失败，请检查后端服务。", "error");
+          setMappingError(`${isMapped ? "取消映射" : "映射"}失败，请检查后端服务。`);
+          showToast(`${isMapped ? "取消映射" : "映射"}失败，请检查后端服务。`, "error");
         } finally {
           setMappingActionLoading(false);
         }
@@ -2653,42 +3311,247 @@ export function BsrBoard({
 
   const filteredItems = useMemo(() => {
     return items.filter((item) => {
-      const priceValue = parsePrice(item.price);
-      const keyword = search.trim().toLowerCase();
+      const keyword = deferredSearch.trim().toLowerCase();
 
       const matchesKeyword =
         !keyword ||
         item.title.toLowerCase().includes(keyword) ||
         item.asin.toLowerCase().includes(keyword);
+      return matchesKeyword;
+    });
+  }, [deferredSearch, items]);
 
-      const matchesBrand = activeBrands.length === 0 || activeBrands.includes(item.brand);
+  const compareOptions = useMemo(() => {
+    const optionsMap = new Map<string, { asin: string; name: string; brand: string; self: boolean; competitor: boolean }>();
 
-      const matchesRating = activeRatings.length === 0 || activeRatings.some(r => {
-        const minRating = Number.parseFloat(r.replace("+", ""));
-        return item.rating >= minRating;
+    const pushOption = (
+      asinRaw: unknown,
+      nameRaw?: unknown,
+      brandRaw?: unknown,
+      sourceType: "self" | "competitor" = "competitor"
+    ) => {
+      const asin = String(asinRaw || "").trim();
+      if (!asin) return;
+      const name = String(nameRaw || "").trim() || asin;
+      const brand = String(brandRaw || "").trim();
+      const existed = optionsMap.get(asin);
+      if (!existed) {
+        optionsMap.set(asin, {
+          asin,
+          name,
+          brand,
+          self: sourceType === "self",
+          competitor: sourceType === "competitor",
+        });
+        return;
+      }
+      optionsMap.set(asin, {
+        asin,
+        name: existed.name === existed.asin && name !== asin ? name : existed.name,
+        brand: existed.brand || brand,
+        self: existed.self || sourceType === "self",
+        competitor: existed.competitor || sourceType === "competitor",
+      });
+    };
+
+    items.forEach((item) => {
+      pushOption(item?.asin, item?.title, item?.brand, "competitor");
+    });
+
+    libraryItems.forEach((item) => {
+      pushOption(item?.asin, item?.product || item?.name, item?.brand, "self");
+    });
+
+    return Array.from(optionsMap.values());
+  }, [items, libraryItems]);
+
+  const compareTypeOptions: Array<"自家" | "竞品"> = ["自家", "竞品"];
+
+  const compareTypeFilteredOptions = useMemo(
+    () =>
+      compareOptions.filter((opt) =>
+        compareTypeFilter === "自家" ? opt.self : opt.competitor
+      ),
+    [compareOptions, compareTypeFilter]
+  );
+
+  const compareBrandOptions = useMemo(
+    () => ["全部", ...Array.from(new Set(compareTypeFilteredOptions.map((opt) => opt.brand).filter(Boolean)))],
+    [compareTypeFilteredOptions]
+  );
+
+  const filteredCompareOptions = useMemo(
+    () =>
+      compareBrandFilter === "全部"
+        ? compareTypeFilteredOptions
+        : compareTypeFilteredOptions.filter((opt) => opt.brand === compareBrandFilter),
+    [compareTypeFilteredOptions, compareBrandFilter]
+  );
+
+  useEffect(() => {
+    if (compareBrandFilter === "全部") {
+      return;
+    }
+    if (!compareBrandOptions.includes(compareBrandFilter)) {
+      setCompareBrandFilter("全部");
+    }
+  }, [compareBrandFilter, compareBrandOptions]);
+
+  const compareProductSelectOptions = useMemo(
+    () =>
+      filteredCompareOptions.map((opt) => ({
+        value: opt.asin,
+        label: opt.name && opt.name !== opt.asin ? opt.name : "未命名产品",
+      })),
+    [filteredCompareOptions]
+  );
+
+  const compareAsinSelectOptions = useMemo(
+    () =>
+      filteredCompareOptions.map((opt) => ({
+        value: opt.asin,
+        label: opt.asin,
+      })),
+    [filteredCompareOptions]
+  );
+
+  const mappedAsins = useMemo(() => splitAsins(mappingLeft?.yida_asin), [mappingLeft?.yida_asin]);
+  const selectedCompareAsin = String(compareTargetAsin || "").trim();
+  const selectedCompareAsinUpper = selectedCompareAsin.toUpperCase();
+
+  useEffect(() => {
+    if (!selectedCompareAsinUpper) {
+      return;
+    }
+    const stillValid = filteredCompareOptions.some(
+      (opt) => String(opt.asin || "").trim().toUpperCase() === selectedCompareAsinUpper
+    );
+    if (stillValid) {
+      return;
+    }
+    setCompareTargetAsin("");
+    setMappingRight(null);
+    setMappingRightMeta(null);
+  }, [filteredCompareOptions, selectedCompareAsinUpper]);
+
+  const selectedInLibrary = useMemo(
+    () => libraryItems.some((item) => String(item?.asin || "").trim().toUpperCase() === selectedCompareAsinUpper),
+    [libraryItems, selectedCompareAsinUpper]
+  );
+  const selectedIsMapped = selectedCompareAsin
+    ? mappedAsins.some((asin) => asin.toUpperCase() === selectedCompareAsinUpper)
+    : false;
+  const selectedIsSelf = selectedCompareAsin
+    ? selectedCompareAsin.toLowerCase() === String(mappingLeft?.asin || "").trim().toLowerCase()
+    : false;
+  const mappingTypeAllowed = compareTypeFilter === "自家";
+  const canMapSelectedAsin =
+    mappingTypeAllowed &&
+    !!mappingLeft &&
+    !!selectedCompareAsin &&
+    selectedInLibrary &&
+    !selectedIsMapped &&
+    !selectedIsSelf;
+  const canCancelSelectedMapping =
+    mappingTypeAllowed &&
+    !!mappingLeft &&
+    !!selectedCompareAsin &&
+    selectedIsMapped;
+  const canToggleMapping = canMapSelectedAsin || canCancelSelectedMapping;
+  const canCreateStrategy = compareTypeFilter === "自家" && !!selectedCompareAsin && selectedIsMapped;
+  const mappingButtonLabel = mappingActionLoading
+    ? selectedIsMapped
+      ? "取消中..."
+      : "映射中..."
+    : selectedIsMapped
+      ? "取消映射"
+      : "映射";
+
+  const compareDateOptions = useMemo(
+    () => dateOptions.filter((option) => option !== dateFilter),
+    [dateOptions, dateFilter]
+  );
+
+  useEffect(() => {
+    if (categoryOptions.length === 0) {
+      setCategoryFilter("");
+      return;
+    }
+    if (!categoryFilter || !categoryOptions.includes(categoryFilter)) {
+      setCategoryFilter(categoryOptions[0]);
+    }
+  }, [categoryFilter, categoryOptions]);
+
+  useEffect(() => {
+    if (!dateLoaded) {
+      setCategoryOptions([]);
+      return;
+    }
+
+    const controller = new AbortController();
+    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+    const payload: Record<string, unknown> = { site: siteFilter };
+    if (dateFilter) {
+      payload.createtime = dateFilter;
+    }
+
+    fetch(`${apiBase}/api/bsr/overview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        return res.json();
+      })
+      .then((data) => {
+        const nextOptions = Array.isArray(data?.category_options)
+          ? data.category_options
+            .map((value: unknown) => String(value || "").trim())
+            .filter(Boolean)
+          : [];
+        setCategoryOptions(nextOptions);
+      })
+      .catch((err) => {
+        if (err.name !== "AbortError") {
+          setCategoryOptions([]);
+        }
       });
 
-      const minValue = priceMin.trim() === "" ? null : Number(priceMin);
-      const maxValue = priceMax.trim() === "" ? null : Number(priceMax);
-      const hasMin = minValue !== null && !Number.isNaN(minValue);
-      const hasMax = maxValue !== null && !Number.isNaN(maxValue);
-      const matchesPrice = (!hasMin && !hasMax)
-        ? true
-        : (hasMin ? priceValue >= (minValue as number) : true) && (hasMax ? priceValue <= (maxValue as number) : true);
+    return () => controller.abort();
+  }, [dateFilter, dateLoaded, siteFilter]);
 
-      const matchesLabel = activeLabels.length === 0 || (item.tags && item.tags.some((tag: string) => activeLabels.includes(tag)));
+  useEffect(() => {
+    if (libraryLoadEnabled) {
+      return;
+    }
+    if (!dateLoaded || loading || loadedKey === "") {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setLibraryLoadEnabled(true);
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [dateLoaded, libraryLoadEnabled, loadedKey, loading]);
 
-      return (
-        matchesKeyword &&
-        matchesBrand &&
-        matchesRating &&
-        matchesPrice &&
-        matchesLabel
-      );
-    });
-  }, [items, search, activeBrands, activeRatings, activeLabels, priceMin, priceMax]);
+  useEffect(() => {
+    setTrendPrefetchEnabled(false);
+    if (!dateLoaded || loading || loadedKey === "") {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setTrendPrefetchEnabled(true);
+    }, 320);
+    return () => window.clearTimeout(timer);
+  }, [dateLoaded, loadedKey, loading]);
 
-  const isInitialLoad = items.length === 0 && loading;
+  const hasRenderedGridItems = items.length > 0;
+  const isGridLoading = loadedKey === "" || loading || dateLoading || !dateLoaded;
+  const isInitialLoad = !hasRenderedGridItems && isGridLoading;
+  const isGridRefreshing = hasRenderedGridItems && isGridLoading;
 
   const clearImportError = useCallback(() => {
     setImportError(null);
@@ -2749,6 +3612,8 @@ export function BsrBoard({
     return () => clearLibraryHoverTimer();
   }, [clearLibraryHoverTimer]);
 
+  const filterSwitchLoading = dateLoading || loading;
+
   return (
     <div className="flex-1 flex min-h-screen bg-[#F7F9FB] w-full">
       <div className={`flex-1 transition-all duration-300 ${collapsed ? "ml-20" : "ml-56"}`}>
@@ -2765,7 +3630,7 @@ export function BsrBoard({
             <Star className="text-xl text-gray-800" weight="fill" />
             <span className="text-gray-400">Dashboards</span>
             <span className="text-gray-300">/</span>
-            <span className="text-gray-900 font-medium">BSR</span>
+            <span className="text-gray-900 font-medium">Best Sellers</span>
           </div>
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
@@ -2773,13 +3638,18 @@ export function BsrBoard({
               <div className="relative w-24" ref={(el) => (dropdownRefs.current["site"] = el)}>
                 <button
                   onClick={() => toggleDropdown("site")}
-                  className="w-full flex justify-between items-center px-3 py-3 bg-gray-50 hover:bg-gray-100 rounded-xl text-sm font-medium text-gray-700 transition"
+                  disabled={filterSwitchLoading}
+                  className="w-full flex justify-between items-center px-4 py-1.5 bg-[#F4F6FA] hover:bg-[#ECEFF5] rounded-xl text-[13px] font-bold text-[#4B5563] border border-[#E7EBF2] transition disabled:opacity-50"
                 >
                   <span className="truncate">{siteFilter}</span>
-                  <CaretDown size={14} className={`text-gray-400 transition-transform ${openDropdown === "site" ? "rotate-180" : ""}`} />
+                  {filterSwitchLoading ? (
+                    <span className="h-3.5 w-3.5 rounded-full border-2 border-[#9AA3B2] border-t-transparent animate-spin" />
+                  ) : (
+                    <CaretDown size={14} className={`text-[#9AA3B2] transition-transform ${openDropdown === "site" ? "rotate-180" : ""}`} />
+                  )}
                 </button>
                 {openDropdown === "site" && (
-                  <div className="z-20 absolute top-full left-0 right-0 mt-2 bg-white rounded-2xl shadow-xl border border-gray-100 p-2 animate-in fade-in slide-in-from-top-2 duration-200">
+                  <div className="z-20 absolute top-full left-0 right-0 mt-2 bg-white rounded-xl shadow-lg border border-[#E7EBF2] p-1.5 max-h-64 overflow-y-auto">
                     <div className="max-h-60 overflow-y-auto custom-scrollbar">
                       {siteOptions.map((site) => (
                         <button
@@ -2788,9 +3658,9 @@ export function BsrBoard({
                             setSiteFilter(site);
                             setOpenDropdown(null);
                           }}
-                          className={`w-full text-left px-3 py-2 rounded-lg text-sm transition ${siteFilter === site
-                            ? "bg-blue-50 text-[#3B9DF8] font-bold"
-                            : "text-gray-600 hover:bg-gray-50"
+                          className={`w-full text-left px-3 py-2 rounded-lg text-sm font-bold transition ${siteFilter === site
+                            ? "bg-[#0C1731] text-white"
+                            : "text-[#4B5563] hover:bg-[#F5F7FB]"
                             }`}
                         >
                           {site}
@@ -2802,21 +3672,70 @@ export function BsrBoard({
               </div>
             </div>
             <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-gray-400">Category</span>
+              <div className="relative w-64" ref={(el) => (dropdownRefs.current["category"] = el)}>
+                <button
+                  onClick={() => toggleDropdown("category")}
+                  disabled={filterSwitchLoading}
+                  className="w-full flex justify-between items-center px-4 py-1.5 bg-[#F4F6FA] hover:bg-[#ECEFF5] rounded-xl text-[13px] font-bold text-[#4B5563] border border-[#E7EBF2] transition disabled:opacity-50"
+                >
+                  <span className="truncate">{categoryFilter || categoryOptions[0] || ""}</span>
+                  {filterSwitchLoading ? (
+                    <span className="h-3.5 w-3.5 rounded-full border-2 border-[#9AA3B2] border-t-transparent animate-spin" />
+                  ) : (
+                    <CaretDown
+                      size={14}
+                      className={`text-[#9AA3B2] transition-transform ${openDropdown === "category" ? "rotate-180" : ""}`}
+                    />
+                  )}
+                </button>
+                {openDropdown === "category" && (
+                  <div className="z-20 absolute top-full left-0 right-0 mt-2 bg-white rounded-xl shadow-lg border border-[#E7EBF2] p-1.5 max-h-64 overflow-y-auto">
+                    <div className="max-h-60 overflow-y-auto custom-scrollbar">
+                      {categoryOptions.map((category) => (
+                        <button
+                          key={category}
+                          type="button"
+                          onClick={() => {
+                            setCategoryFilter(category);
+                            setOpenDropdown(null);
+                          }}
+                          className={`w-full text-left px-3 py-2 rounded-lg text-sm font-bold transition ${categoryFilter === category
+                            ? "bg-[#0C1731] text-white"
+                            : "text-[#4B5563] hover:bg-[#F5F7FB]"
+                            }`}
+                        >
+                          {category}
+                        </button>
+                      ))}
+                      {categoryOptions.length === 0 && (
+                        <div className="px-3 py-2 text-xs text-gray-400">暂无类目</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
               <span className="text-xs font-medium text-gray-400">Date</span>
               <div className="relative w-40" ref={(el) => (dropdownRefs.current["date"] = el)}>
                 <button
                   onClick={() => toggleDropdown("date")}
-                  disabled={dateLoading || dateOptions.length === 0}
-                  className="w-full flex justify-between items-center px-4 py-3 bg-gray-50 hover:bg-gray-100 rounded-xl text-sm font-medium text-gray-700 transition disabled:opacity-50"
+                  disabled={filterSwitchLoading || dateOptions.length === 0}
+                  className="w-full flex justify-between items-center px-4 py-1.5 bg-[#F4F6FA] hover:bg-[#ECEFF5] rounded-xl text-[13px] font-bold text-[#4B5563] border border-[#E7EBF2] transition disabled:opacity-50"
                 >
                   <span className="truncate">
                     {dateFilter || (dateLoading ? "加载中..." : dateError ? "加载失败" : "选择日期")}
                   </span>
-                  <CaretDown size={14} className={`text-gray-400 transition-transform ${openDropdown === "date" ? "rotate-180" : ""}`} />
+                  {filterSwitchLoading ? (
+                    <span className="h-3.5 w-3.5 rounded-full border-2 border-[#9AA3B2] border-t-transparent animate-spin" />
+                  ) : (
+                    <CaretDown size={14} className={`text-[#9AA3B2] transition-transform ${openDropdown === "date" ? "rotate-180" : ""}`} />
+                  )}
                 </button>
 
                 {openDropdown === "date" && (
-                  <div className="z-20 absolute top-full left-0 right-0 mt-2 bg-white rounded-2xl shadow-xl border border-gray-100 p-2 animate-in fade-in slide-in-from-top-2 duration-200">
+                  <div className="z-20 absolute top-full left-0 right-0 mt-2 bg-white rounded-xl shadow-lg border border-[#E7EBF2] p-1.5 max-h-64 overflow-y-auto">
                     <div className="max-h-60 overflow-y-auto custom-scrollbar">
                       {dateOptions.map((date) => (
                         <button
@@ -2825,9 +3744,9 @@ export function BsrBoard({
                             setDateFilter(date);
                             setOpenDropdown(null);
                           }}
-                          className={`w-full text-left px-3 py-2 rounded-lg text-sm transition ${dateFilter === date
-                            ? "bg-blue-50 text-[#3B9DF8] font-bold"
-                            : "text-gray-600 hover:bg-gray-50"
+                          className={`w-full text-left px-3 py-2 rounded-lg text-sm font-bold transition ${dateFilter === date
+                            ? "bg-[#0C1731] text-white"
+                            : "text-[#4B5563] hover:bg-[#F5F7FB]"
                             }`}
                         >
                           {date}
@@ -2841,39 +3760,50 @@ export function BsrBoard({
                 )}
               </div>
             </div>
-            <div className="relative w-56">
-              <MagnifyingGlass size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-              <input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="搜索 ASIN / 标题"
-                className="w-full pl-9 pr-3 py-2.5 rounded-xl bg-gray-50 hover:bg-gray-100 text-sm text-gray-700 transition outline-none focus:ring-2 focus:ring-[#3B9DF8]/30"
-              />
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-gray-400">Compare Date</span>
+              <div className="relative w-40" ref={(el) => (dropdownRefs.current["compareDate"] = el)}>
+                <button
+                  onClick={() => toggleDropdown("compareDate")}
+                  disabled={filterSwitchLoading || compareDateOptions.length === 0}
+                  className="w-full flex justify-between items-center px-4 py-1.5 bg-[#F4F6FA] hover:bg-[#ECEFF5] rounded-xl text-[13px] font-bold text-[#4B5563] border border-[#E7EBF2] transition disabled:opacity-50"
+                >
+                  <span className="truncate">
+                    {compareDate || (dateLoading ? "加载中..." : compareDateOptions.length === 0 ? "无可对比日期" : "选择日期")}
+                  </span>
+                  {filterSwitchLoading ? (
+                    <span className="h-3.5 w-3.5 rounded-full border-2 border-[#9AA3B2] border-t-transparent animate-spin" />
+                  ) : (
+                    <CaretDown size={14} className={`text-[#9AA3B2] transition-transform ${openDropdown === "compareDate" ? "rotate-180" : ""}`} />
+                  )}
+                </button>
+
+                {openDropdown === "compareDate" && (
+                  <div className="z-20 absolute top-full left-0 right-0 mt-2 bg-white rounded-xl shadow-lg border border-[#E7EBF2] p-1.5 max-h-64 overflow-y-auto">
+                    <div className="max-h-60 overflow-y-auto custom-scrollbar">
+                      {compareDateOptions.map((date) => (
+                        <button
+                          key={date}
+                          onClick={() => {
+                            setCompareDate(date);
+                            setOpenDropdown(null);
+                          }}
+                          className={`w-full text-left px-3 py-2 rounded-lg text-sm font-bold transition ${compareDate === date
+                            ? "bg-[#0C1731] text-white"
+                            : "text-[#4B5563] hover:bg-[#F5F7FB]"
+                            }`}
+                        >
+                          {date}
+                        </button>
+                      ))}
+                      {compareDateOptions.length === 0 && (
+                        <div className="px-3 py-2 text-xs text-gray-400">暂无可对比日期</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
-            <button
-              type="button"
-              onClick={handleFetchDaily}
-              disabled={fetchDailyLoading}
-              className="p-2 hover:bg-gray-100 rounded-full text-gray-600 transition disabled:opacity-60 disabled:cursor-not-allowed"
-              title={fetchDailyLoading ? "抓取中..." : "抓取数据"}
-            >
-              {fetchDailyLoading ? (
-                <ArrowsClockwise size={18} className="animate-spin" />
-              ) : (
-                <DownloadSimple size={18} />
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setImportOpen(true);
-                setImportError(null);
-              }}
-              className="p-2 hover:bg-gray-100 rounded-full text-gray-600"
-              title="导入数据"
-            >
-              <UploadSimple size={18} />
-            </button>
             <button
               className="p-2 hover:bg-gray-100 rounded-full text-gray-600"
               onClick={handleToggleFullscreen}
@@ -2894,6 +3824,15 @@ export function BsrBoard({
                   <Funnel size={20} className="text-gray-400" />
                   <h3 className="font-semibold text-gray-900">Filters</h3>
                 </div>
+                <div className="relative mb-4">
+                  <MagnifyingGlass size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                  <input
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="搜索 ASIN / 标题"
+                    className="w-full pl-9 pr-3 py-2 rounded-xl bg-gray-50 hover:bg-gray-100 text-sm text-gray-700 transition outline-none focus:ring-2 focus:ring-[#3B9DF8]/30"
+                  />
+                </div>
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                   {[
                     { key: "brand", label: "Brand", options: brandOptions, selected: activeBrands },
@@ -2904,39 +3843,33 @@ export function BsrBoard({
                       <label className="block text-xs font-medium text-gray-400 mb-1 ml-1">{filter.label}</label>
                       <button
                         onClick={() => toggleDropdown(filter.key as FilterKey)}
-                        className="w-full flex justify-between items-center px-4 py-3 bg-gray-50 hover:bg-gray-100 rounded-xl text-sm font-medium text-gray-700 transition"
+                        className="w-full flex justify-between items-center px-3 py-1.5 bg-[#F4F6FA] hover:bg-[#ECEFF5] rounded-xl text-[13px] font-medium text-[#3D4757] border border-[#E9EDF3] transition"
                       >
                         <span className="truncate">
-                          {filter.selected.length === 0
-                            ? filter.options[0]
-                            : filter.selected.length === 1
-                              ? filter.selected[0]
-                              : `${filter.label}: ${filter.selected.length}`}
+                          {filter.selected.length === 0 ? "ALL" : `${filter.selected.length} selected`}
                         </span>
-                        <CaretDown size={14} className={`text-gray-400 transition-transform ${openDropdown === filter.key ? "rotate-180" : ""}`} />
+                        <CaretDown size={12} className={`text-[#7A8596] transition-transform ${openDropdown === filter.key ? "rotate-180" : ""}`} />
                       </button>
 
                       {openDropdown === filter.key && (
-                        <div className="absolute top-full left-0 right-0 mt-2 bg-white rounded-xl shadow-xl border border-gray-100 p-2 z-30 max-h-64 overflow-y-auto w-full min-w-[160px]">
+                        <div className="absolute top-full left-0 right-0 mt-2 bg-white rounded-xl shadow-lg border border-[#E6EBF2] p-2 z-30 max-h-64 overflow-y-auto w-full min-w-[160px]">
                           {filter.options.map((opt) => {
                             const isSelected = filter.selected.includes(opt) || (opt.startsWith("All ") && filter.selected.length === 0);
                             return (
-                              <button
+                              <label
                                 key={opt}
-                                onClick={() => selectFilter(filter.key as FilterKey, opt)}
-                                className={`w-full text-left px-3 py-2 rounded-lg text-sm transition flex items-center gap-2 ${isSelected
-                                  ? "bg-blue-50 text-[#3B9DF8]"
-                                  : "text-gray-600 hover:bg-gray-50"
-                                  }`}
+                                className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
                               >
-                                <div className={`w-4 h-4 rounded border flex items-center justify-center transition-all ${isSelected
-                                  ? "bg-[#3B9DF8] border-[#3B9DF8]"
-                                  : "border-gray-300"
-                                  }`}>
-                                  {isSelected && <Check size={10} weight="bold" className="text-white" />}
-                                </div>
-                                {opt}
-                              </button>
+                                <input
+                                  type="checkbox"
+                                  className="h-4 w-4 accent-[#0C1731]"
+                                  checked={isSelected}
+                                  onChange={() => selectFilter(filter.key as FilterKey, opt)}
+                                />
+                                <span className={isSelected ? "text-gray-900 font-bold truncate" : "text-gray-600 truncate"}>
+                                  {opt}
+                                </span>
+                              </label>
                             );
                           })}
                         </div>
@@ -2952,14 +3885,14 @@ export function BsrBoard({
                         value={priceMin}
                         onChange={(e) => setPriceMin(e.target.value)}
                         placeholder="Min"
-                        className="w-full px-4 py-3 bg-gray-50 hover:bg-gray-100 rounded-xl text-sm font-medium text-gray-700 transition outline-none focus:ring-2 focus:ring-[#3B9DF8]/30"
+                        className="w-full px-3 py-1.5 bg-[#F4F6FA] hover:bg-[#ECEFF5] rounded-xl text-[13px] font-medium text-[#3D4757] border border-[#E9EDF3] transition outline-none focus:ring-2 focus:ring-[#3B9DF8]/30"
                       />
                       <input
                         type="number"
                         value={priceMax}
                         onChange={(e) => setPriceMax(e.target.value)}
                         placeholder="Max"
-                        className="w-full px-4 py-3 bg-gray-50 hover:bg-gray-100 rounded-xl text-sm font-medium text-gray-700 transition outline-none focus:ring-2 focus:ring-[#3B9DF8]/30"
+                        className="w-full px-3 py-1.5 bg-[#F4F6FA] hover:bg-[#ECEFF5] rounded-xl text-[13px] font-medium text-[#3D4757] border border-[#E9EDF3] transition outline-none focus:ring-2 focus:ring-[#3B9DF8]/30"
                       />
                     </div>
                   </div>
@@ -2968,22 +3901,28 @@ export function BsrBoard({
               </div>
 
               {/* Product Grid */}
-              <div className={`grid grid-cols-1 md:grid-cols-2 ${collapsed ? "lg:grid-cols-5" : "lg:grid-cols-4"} gap-6 min-h-[400px]`}>
-                {isInitialLoad && (
-                  <div className="col-span-full py-20 text-center text-gray-400 bg-white rounded-3xl border border-dashed border-gray-200">
-                    <Sun size={48} className="mx-auto mb-4 opacity-20" />
-                    <p>正在加载 BSR 数据...</p>
+              <div className="relative">
+                {isGridRefreshing && (
+                  <div className="mb-4 flex items-center gap-2 rounded-2xl border border-[#DCE7F8] bg-[#EEF5FF] px-4 py-2 text-sm text-[#315EA8]">
+                    <span className="h-3.5 w-3.5 rounded-full border-2 border-[#315EA8] border-t-transparent animate-spin" />
+                    <span>主列表正在刷新，已优先保留当前结果。</span>
                   </div>
                 )}
+                <div className={`grid grid-cols-1 md:grid-cols-2 ${collapsed ? "lg:grid-cols-5" : "lg:grid-cols-4"} gap-6 min-h-[400px]`}>
+                {isInitialLoad &&
+                  <ProductCardSkeletons
+                    count={collapsed ? 10 : 8}
+                    keyPrefix="bsr-skeleton"
+                  />}
 
-                {!isInitialLoad && error && (
+                {!isInitialLoad && !isGridRefreshing && error && (
                   <div className="col-span-full py-20 text-center text-gray-400 bg-white rounded-3xl border border-dashed border-gray-200">
                     <Sun size={48} className="mx-auto mb-4 opacity-20" />
                     <p>{error}</p>
                   </div>
                 )}
 
-                {filteredItems.map((item) => (
+                {!isInitialLoad && filteredItems.map((item) => (
                   <ProductCard
                     key={`${String(item.site || "US").toUpperCase()}-${item.asin}`}
                     item={item}
@@ -2992,6 +3931,10 @@ export function BsrBoard({
                     onMap={handleMapClick}
                     onCompare={handleCompareClick}
                     onHistory={openHistoryPopover}
+                    enableTrendPrefetch={trendPrefetchEnabled}
+                    detailItem={bsrDetailMap[buildBsrDetailCacheKey(item)]}
+                    detailLoading={!!bsrDetailLoadingMap[buildBsrDetailCacheKey(item)]}
+                    onRequestDetail={requestBsrDetail}
                     monthlySalesTrend={monthlySalesTrendMap[
                       getMonthlyTrendKey(item.asin, item.site || siteFilter)
                     ]}
@@ -2999,12 +3942,13 @@ export function BsrBoard({
                   />
                 ))}
 
-                {!loading && !error && filteredItems.length === 0 && (
+                {!isInitialLoad && !isGridRefreshing && !error && filteredItems.length === 0 && loadedKey !== "" && (
                   <div className="col-span-full py-20 text-center text-gray-400 bg-white rounded-3xl border border-dashed border-gray-200">
                     <MagnifyingGlass size={48} className="mx-auto mb-4 opacity-20" />
                     <p>No products found matching your filters.</p>
                   </div>
                 )}
+              </div>
               </div>
             </div>
 
@@ -3092,31 +4036,70 @@ export function BsrBoard({
                       </div>
                     )}
                   </div>
+
+                  <div className="col-span-2">
+                    <Cascader
+                      options={sidebarCategoryOptions as any}
+                      value={selectedSidebarCategoryPath as any}
+                      onChange={(value) => {
+                        const normalized = Array.isArray(value)
+                          ? value.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 2)
+                          : [];
+                        setSelectedSidebarCategoryPath(normalized);
+                      }}
+                      changeOnSelect
+                      allowClear
+                      placeholder="All Categories"
+                      displayRender={(labels) => labels.join(" / ")}
+                      popupClassName="category-cascader-dropdown"
+                      className="w-full category-cascader bsr-library-category-cascader"
+                    />
+                  </div>
                 </div>
 
 
                 <div className="space-y-4 pr-1 overflow-y-auto overflow-x-visible flex-1 custom-scrollbar">
-                  {libraryLoading && (
+                  {!libraryLoadEnabled && (
+                    <div className="space-y-3">
+                      <div className="p-4 rounded-2xl border border-dashed border-[#D7E3F5] bg-[#F7FAFE] text-sm text-[#6B7A90]">
+                        主列表已优先展示，产品库将在稍后加载。
+                      </div>
+                      {Array.from({ length: 3 }).map((_, idx) => (
+                        <div key={`library-deferred-${idx}`} className="rounded-3xl border border-gray-100 bg-[#F8FAFC] p-4 animate-pulse">
+                          <div className="flex gap-3">
+                            <div className="h-12 w-12 rounded-2xl bg-[#E8EEF6]" />
+                            <div className="flex-1 space-y-2">
+                              <div className="h-4 w-3/4 rounded bg-[#E8EEF6]" />
+                              <div className="h-3 w-1/2 rounded bg-[#EDF2F7]" />
+                            </div>
+                          </div>
+                          <div className="mt-3 h-12 rounded-2xl bg-[#EDF2F7]" />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {libraryLoadEnabled && libraryLoading && (
                     <div className="p-6 text-center text-sm text-gray-400 bg-gray-50 rounded-2xl">
                       正在加载产品库...
                     </div>
                   )}
-                  {!libraryLoading && libraryError && (
+                  {libraryLoadEnabled && !libraryLoading && libraryError && (
                     <div className="p-6 text-center text-sm text-red-500 bg-red-50 rounded-2xl">
                       {libraryError}
                     </div>
                   )}
-                  {!libraryLoading && !libraryError && filteredSidebarProducts.length === 0 && (
+                  {libraryLoadEnabled && !libraryLoading && !libraryError && filteredSidebarProducts.length === 0 && (
                     <div className="p-6 text-center text-sm text-gray-400 bg-gray-50 rounded-2xl">
                       暂无产品库数据
                     </div>
                   )}
-                  {!libraryLoading && !libraryError && filteredSidebarProducts.map((p) => {
+                  {libraryLoadEnabled && !libraryLoading && !libraryError && filteredSidebarProducts.map((p) => {
                     const trendKey = getMonthlyTrendKey(p.asin, p.site || siteFilter);
                     return (
                       <LibraryProductCard
                         key={`${String(p.site || siteFilter || "US").toUpperCase()}-${p.asin}`}
                         product={p}
+                        prevItem={prevItemsMap[p.asin]}
                         siteFilter={siteFilter}
                         selected={selectedLibraryItem?.asin === p.asin}
                         monthlySalesTrend={monthlySalesTrendMap[trendKey]}
@@ -3130,15 +4113,29 @@ export function BsrBoard({
                       />
                     );
                   })}
+                  {libraryLoadEnabled && !libraryLoading && !libraryError && libraryHasMore && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void refreshLibraryItems({
+                          append: true,
+                          keyword: debouncedSidebarSearch,
+                          offset: libraryOffset,
+                        });
+                      }}
+                      disabled={libraryLoadingMore}
+                      className="w-full rounded-2xl border border-[#D9E3F1] bg-[#F7FAFE] px-4 py-3 text-sm font-bold text-[#45638A] hover:bg-[#EEF4FB] transition disabled:opacity-60"
+                    >
+                      {libraryLoadingMore ? "加载更多中..." : "加载更多产品"}
+                    </button>
+                  )}
+                  {libraryLoadEnabled && !libraryLoading && !libraryError && !libraryHasMore && libraryItems.length > 0 && (
+                    <div className="p-3 text-center text-xs text-gray-400">
+                      {debouncedSidebarSearch ? "搜索结果已全部加载" : "产品库已加载完毕"}
+                    </div>
+                  )}
                 </div>
 
-                <button
-                  className="w-full mt-4 py-3 bg-gray-50 text-gray-500 text-sm font-semibold rounded-2xl hover:bg-gray-100 transition flex items-center justify-center gap-2 shrink-0"
-                  onClick={onViewAllProducts}
-                  type="button"
-                >
-                  查看全部产品 <ArrowRight size={14} />
-                </button>
               </div>
             </aside>
           </div>
@@ -3264,6 +4261,7 @@ export function BsrBoard({
                 <div className="flex items-center gap-8">
                   {[
                     { key: "month", label: "月销量" },
+                    { key: "daily", label: "日销量" },
                     { key: "child", label: "子体销量" },
                     { key: "price", label: "价格" },
                     { key: "keepa", label: "Keepa插件替代" },
@@ -3271,7 +4269,7 @@ export function BsrBoard({
                     <button
                       key={tab.key}
                       type="button"
-                      onClick={() => handleHistoryTabChange(tab.key as "month" | "child" | "price" | "keepa")}
+                      onClick={() => handleHistoryTabChange(tab.key as "month" | "child" | "daily" | "price" | "keepa")}
                       className={`pb-3 text-sm font-semibold border-b-2 -mb-px transition-colors ${historyTab === tab.key
                         ? "text-[#F59E0B] border-[#F59E0B]"
                         : "text-gray-500 border-transparent hover:text-gray-700"
@@ -3302,9 +4300,11 @@ export function BsrBoard({
                       ? "暂无历史数据"
                       : historyTab === "child"
                         ? "暂无子体销量数据"
-                        : historyTab === "price"
-                          ? "暂无价格数据"
-                          : "暂无 Keepa 插件替代数据"}
+                        : historyTab === "daily"
+                          ? "暂无日销量数据"
+                          : historyTab === "price"
+                            ? "暂无价格数据"
+                            : "暂无 Keepa 插件替代数据"}
                   </div>
                 )}
                 {!activeHistoryLoading && !activeHistoryError && (activeHistoryData?.length || 0) > 0 && (
@@ -3345,6 +4345,42 @@ export function BsrBoard({
                       </div>
                     )}
                   </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {dailyCompareModalOpen && (
+          <div
+            className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/35 backdrop-blur-sm"
+            onClick={closeDailyCompareModal}
+          >
+            <div
+              className="w-full max-w-5xl bg-white rounded-3xl shadow-2xl border border-gray-100 overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="p-6 border-b border-gray-100 flex items-center justify-between">
+                <div className="text-lg font-black text-gray-900">历史日销量对比</div>
+                <button
+                  type="button"
+                  onClick={closeDailyCompareModal}
+                  className="w-9 h-9 rounded-xl bg-gray-50 text-gray-400 hover:text-gray-900 hover:bg-gray-100 transition flex items-center justify-center"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="p-6 pt-4">
+                {dailyCompareLoading && (
+                  <div className="text-sm text-gray-400 py-10 text-center">加载中...</div>
+                )}
+                {!dailyCompareLoading && dailyCompareError && (
+                  <div className="text-sm text-red-500 py-8 text-center">{dailyCompareError}</div>
+                )}
+                {!dailyCompareLoading && !dailyCompareError && dailyCompareLeftData.length === 0 && dailyCompareRightData.length === 0 && (
+                  <div className="text-sm text-gray-400 py-10 text-center">暂无日销量数据</div>
+                )}
+                {!dailyCompareLoading && !dailyCompareError && (dailyCompareLeftData.length > 0 || dailyCompareRightData.length > 0) && (
+                  <div ref={dailyCompareChartRef} className="w-full h-[500px]" />
                 )}
               </div>
             </div>
@@ -3416,40 +4452,65 @@ export function BsrBoard({
                   </div>
                 </div>
                 <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">品牌</label>
-                  <div className="flex gap-3">
-                    {["EZARC", "TOLESA"].map((brand) => (
-                      <button
-                        key={brand}
-                        type="button"
-                        onClick={() => setProductFormData((prev) => ({ ...prev, brand }))}
-                        className={`flex-1 py-2 px-4 rounded-xl text-sm font-bold transition-all border ${(
-                          productFormData.brand === brand
-                            ? "bg-gray-900 text-white border-gray-900 shadow-md scale-[1.02]"
-                            : "bg-gray-50 text-gray-500 border-gray-100 hover:bg-gray-100 hover:border-gray-200"
-                        )}`}
-                      >
-                        {brand}
-                      </button>
-                    ))}
+                  <label className="block text-sm font-bold text-gray-700 mb-2">类目</label>
+                  <Cascader
+                    options={categoryTreeOptions}
+                    value={findCategoryPathByLeaf(String(productFormData.category || "")) as any}
+                    onChange={(value) =>
+                      setProductFormData((prev) => ({
+                        ...prev,
+                        category: getCategoryLeafFromPath(value as string[]),
+                      }))
+                    }
+                    placeholder="请选择一级/二级/三级分类"
+                    allowClear
+                    showSearch
+                    placement="bottomLeft"
+                    popupClassName="category-cascader-dropdown"
+                    getPopupContainer={() => document.body}
+                    className="w-full category-cascader"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-sm font-bold text-gray-700 mb-2">SKU</label>
+                      <FormInput
+                        value={productFormData.sku || ""}
+                        onChange={(e) => setProductFormData((prev) => ({ ...prev, sku: e.target.value }))}
+                        placeholder="SKU"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-bold text-gray-700 mb-2">ASIN</label>
+                      <FormInput
+                        value={productFormData.asin || ""}
+                        onChange={(e) => setProductFormData((prev) => ({ ...prev, asin: e.target.value }))}
+                        placeholder="ASIN"
+                        disabled
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-bold text-gray-700 mb-2">Brand</label>
+                      <div className="relative">
+                        <FormSelect
+                          value={productFormData.brand || ""}
+                          onChange={(e) => {
+                            const brand = e.target.value;
+                            setProductFormData((prev) => ({ ...prev, brand }));
+                          }}
+                          className="pr-10 appearance-none"
+                        >
+                          <option value="EZARC">EZARC</option>
+                          <option value="TOLESA">TOLESA</option>
+                        </FormSelect>
+                        <CaretDown
+                          size={16}
+                          className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-gray-400"
+                        />
+                      </div>
+                    </div>
                   </div>
-                </div>
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">SKU</label>
-                  <FormInput
-                    value={productFormData.sku || ""}
-                    onChange={(e) => setProductFormData((prev) => ({ ...prev, sku: e.target.value }))}
-                    placeholder="SKU"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">ASIN</label>
-                  <FormInput
-                    value={productFormData.asin || ""}
-                    onChange={(e) => setProductFormData((prev) => ({ ...prev, asin: e.target.value }))}
-                    placeholder="ASIN"
-                    disabled
-                  />
                 </div>
                 <div className="md:col-span-2">
                   <label className="block text-sm font-bold text-gray-700 mb-2">产品名称</label>
@@ -3533,27 +4594,6 @@ export function BsrBoard({
                 </div>
                 <div className="md:col-span-2">
                   <div className="flex items-center justify-between mb-2">
-                    <label className="text-sm font-bold text-gray-700">齿形标签</label>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => openFieldTagModal("tooth_pattern_tags")}
-                        className="px-3 py-1.5 rounded-xl bg-gray-50 border border-gray-100 text-xs font-semibold text-gray-600 hover:bg-white hover:border-gray-200 transition-all"
-                      >
-                        管理标签
-                      </button>
-                    </div>
-                  </div>
-                  <div className="flex flex-col gap-2">
-                    <TagPillList
-                      value={productFormData.tooth_pattern_tags}
-                      toneClass="bg-purple-100 text-purple-600"
-                      stack
-                    />
-                  </div>
-                </div>
-                <div className="md:col-span-2">
-                  <div className="flex items-center justify-between mb-2">
                     <label className="text-sm font-bold text-gray-700">材质标签</label>
                     <div className="flex items-center gap-2">
                       <button
@@ -3590,6 +4630,27 @@ export function BsrBoard({
                     <TagPillList
                       value={productFormData.position_tags}
                       toneClass="bg-yellow-100 text-yellow-600"
+                      stack
+                    />
+                  </div>
+                </div>
+                <div className="md:col-span-2">
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-sm font-bold text-gray-700">其他标签</label>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => openFieldTagModal("other_tags")}
+                        className="px-3 py-1.5 rounded-xl bg-gray-50 border border-gray-100 text-xs font-semibold text-gray-600 hover:bg-white hover:border-gray-200 transition-all"
+                      >
+                        管理标签
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <TagPillList
+                      value={productFormData.other_tags}
+                      toneClass="bg-purple-100 text-purple-600"
                       stack
                     />
                   </div>
@@ -3846,13 +4907,13 @@ export function BsrBoard({
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">月销售额($)</label>
+                  <label className="block text-sm font-bold text-gray-700 mb-2">月销售额({getCurrencySymbol(productBsrForm.site || siteFilter)})</label>
                   <FormInput
                     type="number"
                     step="0.01"
                     value={productBsrForm.sales}
                     onChange={(e) => setProductBsrForm((prev) => ({ ...prev, sales: e.target.value }))}
-                    placeholder="月销售额($)"
+                    placeholder={`月销售额(${getCurrencySymbol(productBsrForm.site || siteFilter)})`}
                   />
                 </div>
                 <div className="md:col-span-2">
@@ -3915,46 +4976,58 @@ export function BsrBoard({
                 {/* Left Content Area */}
                 <div className="flex-1 p-8 overflow-y-auto custom-scrollbar border-r border-gray-50">
                   <div className="mb-6">
-                    <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center justify-between gap-4 mb-4">
                       <h3 className="text-lg font-black text-gray-900">映射对比</h3>
-                      <div className="hidden sm:flex items-center gap-3">
-                        <span className="text-xs text-gray-900">产品</span>
-                        <CustomSelect
-                          className="w-80"
-                          value={compareTargetAsin || mappingRightMeta?.asin || ""}
-                          onChange={(val) => handleCompareSelect(val)}
-                          options={compareOptions.map((opt) => ({
-                            value: opt.asin,
-                            label: opt.name,
-                          }))}
-                        />
-                        <span className="text-xs text-gray-900 ml-1">ASIN</span>
-                        <CustomSelect
-                          className="w-48"
-                          value={compareTargetAsin || mappingRightMeta?.asin || ""}
-                          onChange={(val) => handleCompareSelect(val)}
-                          options={compareOptions.map((opt) => ({
-                            value: opt.asin,
-                            label: opt.asin,
-                          }))}
-                        />
-                        <button
-                          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${mappingLeft?.yida_asin
+                      <button
+                        onClick={closeMappingModal}
+                        className="p-2 hover:bg-gray-200 rounded-xl text-gray-400 hover:text-gray-900 transition-all"
+                      >
+                        <X size={20} weight="bold" />
+                      </button>
+                    </div>
+                    <div className="flex flex-nowrap items-center justify-end gap-3 overflow-visible">
+                      <span className="text-xs text-gray-900 shrink-0">对比类型</span>
+                      <CustomSelect
+                        className="w-24 shrink-0"
+                        value={compareTypeFilter}
+                        onChange={(val) => setCompareTypeFilter(val as "自家" | "竞品")}
+                        options={compareTypeOptions}
+                      />
+                      <span className="text-xs text-gray-900 shrink-0">品牌</span>
+                      <CustomSelect
+                        className="w-36 shrink-0"
+                        value={compareBrandFilter}
+                        onChange={setCompareBrandFilter}
+                        options={compareBrandOptions}
+                      />
+                      <span className="text-xs text-gray-900 shrink-0">名称</span>
+                      <CustomSelect
+                        className="w-[260px] shrink-0"
+                        value={compareTargetAsin}
+                        onChange={(val) => handleCompareSelect(val)}
+                        options={compareProductSelectOptions}
+                      />
+                      <span className="text-xs text-gray-900 shrink-0">ASIN</span>
+                      <CustomSelect
+                        className="w-40 shrink-0"
+                        value={compareTargetAsin}
+                        onChange={(val) => handleCompareSelect(val)}
+                        editable
+                        placeholder="输入或选择ASIN"
+                        options={compareAsinSelectOptions}
+                      />
+                      <button
+                        className={`px-4 py-2 rounded-xl text-xs font-bold transition-all shrink-0 ${canToggleMapping
+                          ? selectedIsMapped
                             ? "bg-red-50 text-red-600 hover:bg-red-100"
-                            : "bg-gray-100 text-gray-400 cursor-not-allowed"
-                            }`}
-                          onClick={handleCancelMapping}
-                          disabled={!mappingLeft?.yida_asin || mappingActionLoading}
-                        >
-                          {mappingActionLoading ? "取消中..." : "取消映射"}
-                        </button>
-                        <button
-                          onClick={closeMappingModal}
-                          className="p-2 hover:bg-gray-200 rounded-xl text-gray-400 hover:text-gray-900 transition-all"
-                        >
-                          <X size={20} weight="bold" />
-                        </button>
-                      </div>
+                            : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                          : "bg-gray-100 text-gray-400 cursor-not-allowed"
+                          }`}
+                        onClick={handleToggleMapping}
+                        disabled={!canToggleMapping || mappingActionLoading}
+                      >
+                        {mappingButtonLabel}
+                      </button>
                     </div>
                   </div>
 
@@ -3984,7 +5057,7 @@ export function BsrBoard({
                         </div>
 
                         <div className="bg-slate-50 rounded-3xl p-4 border border-gray-100/50">
-                          <div className="text-xs text-gray-400 mb-2">自家产品</div>
+                          <div className="text-xs text-gray-400 mb-2">对比产品</div>
                           <div className="min-h-[54px]">
                             <div className="text-sm font-bold text-gray-900 line-clamp-2">
                               {mappingRightMeta?.product || mappingRightMeta?.name || "-"}
@@ -4009,7 +5082,17 @@ export function BsrBoard({
                             </div>
 
                             <div className={`h-7 flex items-center justify-center font-bold text-xs ${row.diffClass}`}>
-                              {row.diffText}
+                              {row.key === "daily_sales_compare" ? (
+                                <button
+                                  type="button"
+                                  onClick={openDailyCompareModal}
+                                  className="px-3 py-1 rounded-lg text-[11px] font-bold text-white bg-[#1C1C1E] hover:bg-black transition"
+                                >
+                                  查看趋势
+                                </button>
+                              ) : (
+                                row.diffText
+                              )}
                             </div>
 
                             <div className="flex justify-between items-center h-7 text-xs text-gray-600 bg-slate-50/50 rounded-xl px-4">
@@ -4026,10 +5109,10 @@ export function BsrBoard({
                   <div className="mt-8 pt-6 border-t border-gray-100">
                     <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 mb-6">
                       <div>
-                        <h4 className="text-lg font-black text-gray-900">策略管理</h4>
+                        <h4 className="text-lg font-black text-gray-900">待办管理</h4>
                       </div>
                       <div className="flex flex-wrap gap-2">
-                        {isAdmin && (
+                        {canAssignStrategyOwner && (
                           <CustomSelect
                             value={strategyFilters.owner}
                             onChange={(val: string) => setStrategyFilters((prev) => ({ ...prev, owner: val }))}
@@ -4057,10 +5140,32 @@ export function BsrBoard({
                         />
                         <button
                           type="button"
-                          onClick={() => setStrategyOpen(true)}
-                          className="min-w-[96px] px-3 py-2 rounded-xl text-xs font-bold text-white bg-gradient-to-br from-[#1C1C1E] to-[#2C2C2E] hover:shadow-lg hover:shadow-black/10 active:scale-95 transition-all shadow-sm"
+                          onClick={() => {
+                            if (!canCreateStrategy) {
+                              showToast("请先选择已映射的自家ASIN，再新建待办。", "info");
+                              return;
+                            }
+                            setStrategyFormData({
+                              title: "",
+                              detail: "",
+                              owner: "",
+                              owner_userid: "",
+                              participant_userids: [],
+                              review_date: "",
+                              deadline_time: "18:00",
+                              reminder_time: "无",
+                              priority: "普通",
+                              state: "待开始",
+                            });
+                            setStrategyOpen(true);
+                          }}
+                          className={`min-w-[96px] px-3 py-2 rounded-xl text-xs font-bold transition-all shadow-sm ${canCreateStrategy
+                            ? "text-white bg-gradient-to-br from-[#1C1C1E] to-[#2C2C2E] hover:shadow-lg hover:shadow-black/10 active:scale-95"
+                            : "text-gray-400 bg-gray-100 cursor-not-allowed"
+                            }`}
+                          disabled={!canCreateStrategy}
                         >
-                          新建策略
+                          新建待办
                         </button>
                       </div>
                     </div>
@@ -4072,11 +5177,11 @@ export function BsrBoard({
                           style={{ gridTemplateColumns: strategyGridTemplate }}
                         >
                           <span>策略标题</span>
-                          <span>自家ASIN</span>
+                          <span>描述</span>
                           <span>品牌</span>
                           <span>负责人</span>
                           <span>优先级</span>
-                          <span>计划复盘</span>
+                          <span>日期</span>
                           <span>状态</span>
                           <span className={`text-right ${selectedStrategy ? "pr-4" : ""}`}>操作</span>
                         </div>
@@ -4102,10 +5207,10 @@ export function BsrBoard({
                                     <div className="font-semibold text-gray-900">{task.title}</div>
                                     <div className="text-[11px] text-gray-400 mt-1">创建于 {task.created_at || "-"}</div>
                                   </div>
-                                  <div className="font-mono text-[11px]">{task.yida_asin}</div>
+                                  <div className="text-[11px] text-gray-500 line-clamp-2">{task.detail || "-"}</div>
                                   <div>{task.brand || "-"}</div>
                                   <div>{task.owner || "-"}</div>
-                                  <div>{task.priority}</div>
+                                  <div>{task.priority || "-"}</div>
                                   <div>{task.review_date || "-"}</div>
                                   <div>
                                     <span className={`inline-flex px-2 py-1 rounded-full text-[10px] font-bold ${badge}`}>
@@ -4136,7 +5241,7 @@ export function BsrBoard({
                   <div className="w-full lg:w-[320px] xl:w-[400px] bg-gray-50/50 p-8 overflow-y-auto custom-scrollbar animate-in slide-in-from-right duration-300 border-l border-gray-100">
                     <div className="flex items-center justify-between mb-8">
                       <div>
-                        <h4 className="text-lg font-black text-gray-900">策略详情</h4>
+                        <h4 className="text-lg font-black text-gray-900">待办详情</h4>
                       </div>
                       <button
                         onClick={() => setSelectedStrategy(null)}
@@ -4148,14 +5253,22 @@ export function BsrBoard({
 
                     <div className="space-y-8">
                       <div>
-                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">策略标题</label>
-                        <FormInput
-                          size="sm"
+                        <p className="text-[11px] text-gray-400 mb-2">创建于 {selectedStrategy.created_at}</p>
+                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">待办事项</label>
+                        <textarea
                           value={strategyEdit.title}
                           onChange={(e) => handleStrategyEditChange("title", e.target.value)}
-                          className="bg-white text-sm font-semibold text-gray-900"
+                          className="w-full min-h-[180px] bg-white p-4 rounded-2xl border border-gray-100 text-sm text-gray-600 whitespace-pre-wrap leading-relaxed shadow-sm font-medium focus:ring-4 focus:ring-blue-100 outline-none"
                         />
-                        <p className="text-[11px] text-gray-400 mt-1">创建于 {selectedStrategy.created_at}</p>
+                      </div>
+
+                      <div className="pt-3 border-t border-gray-200/50">
+                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-3">描述</label>
+                        <textarea
+                          value={strategyEdit.detail}
+                          onChange={(e) => handleStrategyEditChange("detail", e.target.value)}
+                          className="w-full min-h-[120px] bg-white p-4 rounded-2xl border border-gray-100 text-sm text-gray-600 whitespace-pre-wrap leading-relaxed shadow-sm font-medium focus:ring-4 focus:ring-blue-100 outline-none"
+                        />
                       </div>
 
                       <div className="grid grid-cols-2 gap-y-6 gap-4">
@@ -4172,13 +5285,13 @@ export function BsrBoard({
                           <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">品牌</span>
                           <span className="text-[12px] font-bold text-gray-900">{selectedStrategy.brand || "-"}</span>
                         </div>
-                        <div className="flex flex-col gap-1">
+                        <div className="flex flex-col gap-1 col-span-2">
                           <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">负责人</span>
-                          {isAdmin ? (
+                          {canAssignStrategyOwner ? (
                             <CustomSelect
                               value={strategyEdit.owner_userid || ""}
                               onChange={(val: string) => handleStrategyEditOwnerSelect(val)}
-                              options={strategyOwnerSelectOptions}
+                              options={strategyOwnerOptions}
                               className="w-full"
                               innerClassName="bg-white border-gray-100 text-[12px] font-bold text-gray-900 focus:ring-4 focus:ring-blue-100 py-2"
                             />
@@ -4191,18 +5304,66 @@ export function BsrBoard({
                             />
                           )}
                         </div>
+                        <div className="flex flex-col gap-1 col-span-2">
+                          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">日期</span>
+                          <AppDatePicker
+                            value={strategyEdit.review_date}
+                            onChange={(val) => handleStrategyEditChange("review_date", val)}
+                            size="sm"
+                            className="bg-white border border-gray-100 text-[12px] font-bold text-gray-900"
+                          />
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">截止时间</span>
+                          <div className="grid grid-cols-[1fr_1fr] gap-2 w-full">
+                            <CustomSelect
+                              value={String(strategyEdit.deadline_time || "18:00").split(":")[0] || "18"}
+                              onChange={(hour: string) => {
+                                const minute = String(strategyEdit.deadline_time || "18:00").split(":")[1] || "00";
+                                handleStrategyEditChange("deadline_time", `${hour}:${minute}`);
+                              }}
+                              options={deadlineHourOptions}
+                              className="w-full"
+                              innerClassName="bg-white border-gray-100 text-[12px] font-bold text-gray-900 focus:ring-4 focus:ring-blue-100 py-2"
+                            />
+                            <CustomSelect
+                              value={String(strategyEdit.deadline_time || "18:00").split(":")[1] || "00"}
+                              onChange={(minute: string) => {
+                                const hour = String(strategyEdit.deadline_time || "18:00").split(":")[0] || "18";
+                                handleStrategyEditChange("deadline_time", `${hour}:${minute}`);
+                              }}
+                              options={deadlineMinuteOptions}
+                              className="w-full"
+                              innerClassName="bg-white border-gray-100 text-[12px] font-bold text-gray-900 focus:ring-4 focus:ring-blue-100 py-2"
+                            />
+                          </div>
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">提醒时间</span>
+                          <FormInput
+                            size="sm"
+                            value={String(strategyEdit.reminder_time || "无")}
+                            disabled
+                            className="bg-gray-100 text-[12px] font-semibold text-gray-700"
+                          />
+                        </div>
                         <div className="flex flex-col gap-1">
                           <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">优先级</span>
                           <CustomSelect
                             value={strategyEdit.priority}
                             onChange={(val: string) => handleStrategyEditChange("priority", val)}
-                            options={["高", "中", "低"]}
+                            options={[
+                              { value: "较低", label: "较低" },
+                              { value: "普通", label: "普通" },
+                              { value: "较高", label: "较高" },
+                              { value: "紧急", label: "紧急", itemClassName: "text-[#F97316]" },
+                            ]}
                             className="w-full"
                             innerClassName="bg-white border-gray-100 text-[12px] font-bold text-gray-900 focus:ring-4 focus:ring-blue-100 py-2"
                           />
                         </div>
                         <div className="flex flex-col gap-1">
-                          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">执行状态</span>
+                          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">状态</span>
                           <CustomSelect
                             value={strategyEdit.state}
                             onChange={(val: string) => handleStrategyEditChange("state", val)}
@@ -4212,23 +5373,16 @@ export function BsrBoard({
                           />
                         </div>
                         <div className="flex flex-col gap-1 col-span-2">
-                          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">计划复盘</span>
-                          <AppDatePicker
-                            value={strategyEdit.review_date}
-                            onChange={(val) => handleStrategyEditChange("review_date", val)}
-                            size="sm"
-                            className="bg-white border border-gray-100 text-[12px] font-bold text-gray-900"
+                          <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">参与人</span>
+                          <CustomMultiSelect
+                            values={strategyEdit.participant_userids}
+                            onChange={(vals) => setStrategyEdit((prev) => ({ ...prev, participant_userids: vals }))}
+                            options={strategyParticipantOptions}
+                            placeholder="搜索参与人"
+                            className="w-full"
+                            innerClassName="bg-white border-gray-100 text-[12px] font-bold text-gray-900 focus:ring-4 focus:ring-blue-100 py-2"
                           />
                         </div>
-                      </div>
-
-                      <div className="pt-3 border-t border-gray-200/50">
-                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-3">详细方案说明</label>
-                        <textarea
-                          value={strategyEdit.detail}
-                          onChange={(e) => handleStrategyEditChange("detail", e.target.value)}
-                          className="w-full min-h-[180px] bg-white p-4 rounded-2xl border border-gray-100 text-sm text-gray-600 whitespace-pre-wrap leading-relaxed shadow-sm font-medium focus:ring-4 focus:ring-blue-100 outline-none"
-                        />
                       </div>
 
                       <div className="pt-2 flex gap-3">
@@ -4300,125 +5454,255 @@ export function BsrBoard({
 
         {/* Create Strategy Modal */}
         {strategyOpen && (
-          <div className="fixed inset-0 z-[92] flex items-center justify-center p-4 backdrop-blur-sm bg-black/40 animate-in fade-in duration-200">
-            <div className="w-full max-w-4xl bg-white rounded-[2rem] shadow-2xl border border-gray-100 overflow-hidden animate-in zoom-in duration-200">
-              <div className="p-8">
-                <div className="flex items-center justify-between mb-6">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-[#3B9DF8]">
-                      <ChartLineUp size={22} weight="fill" />
-                    </div>
-                    <div>
-                      <h4 className="text-lg font-bold text-gray-900">制定打法策略</h4>
-                      <p className="text-xs text-gray-400 mt-0.5">记录针对该竞品的作战计划</p>
-                    </div>
-                  </div>
-                  <button
-                    className="w-10 h-10 flex items-center justify-center rounded-2xl bg-gray-50 text-gray-400 hover:text-gray-900 hover:bg-gray-100 transition-all"
-                    onClick={() => setStrategyOpen(false)}
-                  >
-                    <span className="text-xl">✕</span>
-                  </button>
+          <div className="fixed inset-0 z-[92] flex items-center justify-center p-4 bg-black/30 animate-in fade-in duration-200">
+            <div className="w-full max-w-5xl h-[90vh] bg-white rounded-[20px] shadow-2xl border border-gray-200 overflow-visible animate-in zoom-in duration-200 flex flex-col">
+              <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+                <h4 className="text-xl leading-none font-semibold text-gray-900">新建待办</h4>
+                <button
+                  className="w-9 h-9 rounded-full text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition"
+                  onClick={() => setStrategyOpen(false)}
+                  disabled={strategySaving}
+                  aria-label="关闭"
+                >
+                  <span className="text-xl leading-none">×</span>
+                </button>
+              </div>
+
+              <div className="px-6 py-4 space-y-5 flex-1 overflow-visible">
+                <div>
+                  <textarea
+                    placeholder="写下你的待办事项"
+                    value={strategyFormData.title}
+                    onChange={(e) => handleStrategyChange("title", e.target.value)}
+                    className="w-full px-0 py-0 bg-transparent border-none text-[20px] leading-tight font-semibold text-gray-900 placeholder:text-gray-300 outline-none min-h-[84px] resize-none"
+                  />
                 </div>
 
-                <div className="space-y-6">
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    <div className="space-y-2">
-                      <label className="text-xs font-black text-gray-900 ml-1">计划复盘日期</label>
-                      <AppDatePicker
-                        value={strategyFormData.review_date}
-                        onChange={(val) => handleStrategyChange("review_date", val)}
-                        size="lg"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <label className="text-xs font-black text-gray-900 ml-1">负责人</label>
-                      {isAdmin ? (
+                <div className="grid grid-cols-[32px_1fr] items-start gap-3">
+                  <span className="text-gray-400 leading-none pt-1">
+                    <ClipboardText size={20} weight="regular" />
+                  </span>
+                  <textarea
+                    placeholder="添加描述"
+                    className="w-full px-0 py-0 bg-transparent border-none text-[20px] leading-tight text-gray-900 placeholder:text-gray-300 outline-none min-h-[52px] resize-none"
+                    value={strategyFormData.detail}
+                    onChange={(e) => handleStrategyChange("detail", e.target.value)}
+                  />
+                </div>
+
+                <div className="space-y-4 pt-2">
+                  <div className="grid grid-cols-[32px_1fr] items-center gap-3">
+                    <span className="text-gray-400 leading-none">
+                      <User size={20} weight="regular" />
+                    </span>
+                    <div className="grid grid-cols-[72px_minmax(220px,1fr)] items-center gap-3">
+                      <span className="text-sm text-gray-700">负责人</span>
+                      {canAssignStrategyOwner ? (
                         <CustomSelect
                           value={strategyFormData.owner_userid}
                           onChange={(val) => handleStrategyOwnerSelect(val)}
                           options={strategyOwnerSelectOptions}
-                          className="w-full"
-                          innerClassName="bg-gray-50 border-gray-100 text-sm font-semibold text-gray-700 py-3"
+                          placeholder="搜索负责人"
+                          className="w-full max-w-[520px]"
+                          innerClassName="bg-white border-gray-200 text-sm font-medium text-gray-700 py-2"
                         />
                       ) : (
-                        <FormInput
-                          size="lg"
-                          type="text"
-                          placeholder="选择团队成员"
-                          value={currentUserName || strategyFormData.owner}
-                          disabled
-                        />
+                        <div className="w-full max-w-[520px] rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-700">
+                          {currentUserName || strategyFormData.owner || "搜索负责人"}
+                        </div>
                       )}
                     </div>
-                    <div className="space-y-2">
-                      <label className="text-xs font-black text-gray-900 ml-1">优先级</label>
-                      <div className="flex p-1 bg-gray-50 rounded-2xl border border-gray-100">
-                        {["高", "中", "低"].map((p) => (
-                          <button
-                            key={p}
-                            onClick={() => handleStrategyChange("priority", p)}
-                            className={`flex-1 py-1.5 text-xs font-bold rounded-xl transition-all ${strategyFormData.priority === p
-                              ? "bg-white text-gray-900 shadow-sm ring-1 ring-black/5"
-                              : "text-gray-400 hover:text-gray-600"
-                              }`}
-                          >
-                            {p}
-                          </button>
-                        ))}
+                  </div>
+
+                  <div className="grid grid-cols-[32px_1fr] items-center gap-3">
+                    <span className="text-gray-400 leading-none">
+                      <CalendarBlank size={20} weight="regular" />
+                    </span>
+                    <div className="grid grid-cols-[72px_minmax(220px,1fr)] items-center gap-3 min-h-[44px]">
+                      <span className="text-sm text-gray-700">日期</span>
+                      <div className="flex flex-wrap items-center gap-2 min-h-[44px]">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setStrategyFormData((prev) => ({
+                              ...prev,
+                              review_date: todayReviewDate,
+                              deadline_time: "18:00",
+                              reminder_time: "截止前15分钟",
+                            }))
+                          }
+                          className={`h-[40px] px-4 rounded-xl border text-sm transition ${strategyFormData.review_date === todayReviewDate
+                            ? "bg-blue-50 border-blue-200 text-blue-700"
+                            : "bg-white border-gray-200 text-gray-700 hover:bg-gray-50"
+                            }`}
+                        >
+                          今天
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setStrategyFormData((prev) => ({
+                              ...prev,
+                              review_date: tomorrowReviewDate,
+                              deadline_time: "18:00",
+                              reminder_time: "截止前15分钟",
+                            }))
+                          }
+                          className={`h-[40px] px-4 rounded-xl border text-sm transition ${strategyFormData.review_date === tomorrowReviewDate
+                            ? "bg-green-50 border-green-200 text-green-700"
+                            : "bg-white border-gray-200 text-gray-700 hover:bg-gray-50"
+                            }`}
+                        >
+                          明天
+                        </button>
+                        <div className="w-[270px]">
+                          <AppDatePicker
+                            value={
+                              strategyFormData.review_date !== todayReviewDate &&
+                                strategyFormData.review_date !== tomorrowReviewDate
+                                ? strategyFormData.review_date
+                                : ""
+                            }
+                            onChange={(val) => handleStrategyChange("review_date", val)}
+                            placeholder="其他日期"
+                            size="md"
+                            align="left"
+                            className="bg-white border-gray-200 text-sm"
+                          />
+                        </div>
                       </div>
                     </div>
                   </div>
 
-                  <div className="space-y-2">
-                    <label className="text-xs font-black text-gray-900 ml-1">策略标题 <span className="text-red-500">*</span></label>
-                    <FormInput
-                      size="lg"
-                      type="text"
-                      placeholder="例如：通过价格优势拦截流量"
-                      value={strategyFormData.title}
-                      onChange={(e) => handleStrategyChange("title", e.target.value)}
-                    />
+                  <div className="grid grid-cols-[32px_1fr] items-center gap-3">
+                    <span className="text-gray-400 leading-none">
+                      <Clock size={20} weight="regular" />
+                    </span>
+                    <div className="grid grid-cols-[72px_220px] items-center gap-3">
+                      <span className="text-sm text-gray-700">截止时间</span>
+                      <div className="grid grid-cols-[1fr_1fr] gap-2 w-full">
+                        <CustomSelect
+                          value={String(strategyFormData.deadline_time || "18:00").split(":")[0] || "18"}
+                          onChange={(hour) => {
+                            const minute = String(strategyFormData.deadline_time || "18:00").split(":")[1] || "00";
+                            handleStrategyChange("deadline_time", `${hour}:${minute}`);
+                          }}
+                          options={deadlineHourOptions}
+                          className="w-full"
+                          innerClassName="bg-white border-gray-200 text-sm font-medium text-gray-700 py-2"
+                        />
+                        <CustomSelect
+                          value={String(strategyFormData.deadline_time || "18:00").split(":")[1] || "00"}
+                          onChange={(minute) => {
+                            const hour = String(strategyFormData.deadline_time || "18:00").split(":")[0] || "18";
+                            handleStrategyChange("deadline_time", `${hour}:${minute}`);
+                          }}
+                          options={deadlineMinuteOptions}
+                          className="w-full"
+                          innerClassName="bg-white border-gray-200 text-sm font-medium text-gray-700 py-2"
+                        />
+                      </div>
+                    </div>
                   </div>
 
-                  <div className="space-y-2">
-                    <label className="text-xs font-black text-gray-900 ml-1">策略详情 <span className="text-red-500">*</span></label>
-                    <textarea
-                      placeholder="描述具体打法，如：调整广告出价、增加优惠券力度等..."
-                      className="w-full px-5 py-4 rounded-3xl bg-gray-50 border border-gray-100 text-sm focus:bg-white focus:ring-4 focus:ring-blue-100 outline-none transition-all min-h-[120px] resize-none"
-                      value={strategyFormData.detail}
-                      onChange={(e) => handleStrategyChange("detail", e.target.value)}
-                    />
+                  <div className="grid grid-cols-[32px_1fr] items-center gap-3">
+                    <span className="text-gray-400 leading-none">
+                      <Bell size={20} weight="regular" />
+                    </span>
+                    <div className="grid grid-cols-[72px_220px] items-center gap-3">
+                      <span className="text-sm text-gray-700">提醒时间</span>
+                      <CustomSelect
+                        value={String(strategyFormData.reminder_time)}
+                        onChange={(val) => handleStrategyChange("reminder_time", val)}
+                        options={["无", "截止时", "截止前15分钟", "截止前1小时", "截止前3小时", "截止前1天"]}
+                        className="w-full"
+                        innerClassName="bg-white border-gray-200 text-sm font-medium text-gray-700 py-2"
+                      />
+                    </div>
                   </div>
 
-                  <div className="flex justify-end pt-2 gap-3">
-                    <button
-                      type="button"
-                      className="px-8 py-3 rounded-2xl text-sm font-bold text-gray-500 hover:text-gray-900 hover:bg-gray-50 active:scale-95 transition-all"
-                      onClick={() => setStrategyOpen(false)}
-                      disabled={strategySaving}
-                    >
-                      取消
-                    </button>
-                    <button
-                      onClick={handleSaveStrategy}
-                      disabled={strategySaving || !strategyFormData.title || !strategyFormData.detail}
-                      className="px-10 py-4 rounded-2xl text-sm font-bold text-white bg-gradient-to-br from-[#1C1C1E] to-[#2C2C2E] hover:shadow-xl hover:shadow-black/10 active:scale-95 disabled:opacity-40 transition-all flex items-center gap-2"
-                    >
-                      {strategySaving ? (
-                        <>
-                          <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                          正在保存...
-                        </>
-                      ) : (
-                        <>
-                          <CheckCircle size={18} weight="fill" />
-                          保存为待办
-                        </>
-                      )}
-                    </button>
+                  <div className="grid grid-cols-[32px_1fr] items-center gap-3">
+                    <span className="text-gray-400 leading-none">
+                      <Flag size={20} weight="regular" />
+                    </span>
+                    <div className="grid grid-cols-[72px_220px] items-center gap-3">
+                      <span className="text-sm text-gray-700">优先级</span>
+                      <CustomSelect
+                        value={strategyFormData.priority}
+                        onChange={(val) => handleStrategyChange("priority", val)}
+                        options={[
+                          { value: "较低", label: "较低" },
+                          { value: "普通", label: "普通" },
+                          { value: "较高", label: "较高" },
+                          { value: "紧急", label: "紧急", itemClassName: "text-[#F97316]" },
+                        ]}
+                        className="w-full"
+                        innerClassName="bg-white border-gray-200 text-sm font-medium text-gray-700 py-2"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-[32px_1fr] items-center gap-3">
+                    <span className="text-gray-400 leading-none">
+                      <CheckCircle size={20} weight="regular" />
+                    </span>
+                    <div className="grid grid-cols-[72px_220px] items-center gap-3">
+                      <span className="text-sm text-gray-700">状态</span>
+                      <CustomSelect
+                        value={strategyFormData.state}
+                        onChange={(val) => handleStrategyChange("state", val)}
+                        options={["待开始", "进行中", "已完成", "搁置"]}
+                        className="w-full"
+                        innerClassName="bg-white border-gray-200 text-sm font-medium text-gray-700 py-2"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-[32px_1fr] items-center gap-3">
+                    <span className="text-gray-400 leading-none">
+                      <UserPlus size={20} weight="regular" />
+                    </span>
+                    <div className="grid grid-cols-[72px_minmax(220px,1fr)] items-center gap-3">
+                      <span className="text-sm text-gray-700">参与人</span>
+                      <CustomMultiSelect
+                        values={strategyFormData.participant_userids}
+                        onChange={(vals) => handleStrategyChange("participant_userids", vals)}
+                        options={strategyParticipantOptions}
+                        placeholder="搜索参与人"
+                        className="w-full max-w-[520px]"
+                        innerClassName="bg-white border-gray-200 text-sm font-medium text-gray-700 py-2"
+                      />
+                    </div>
                   </div>
                 </div>
+              </div>
+
+              <div className="px-6 py-3 border-t border-gray-100 flex justify-end gap-3 bg-white">
+                <button
+                  type="button"
+                  className="px-6 py-2 rounded-full text-sm leading-none font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 transition disabled:opacity-50"
+                  onClick={() => setStrategyOpen(false)}
+                  disabled={strategySaving}
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleSaveStrategy}
+                  disabled={
+                    strategySaving ||
+                    !String(strategyFormData.title || "").trim() ||
+                    !String(strategyFormData.detail || "").trim() ||
+                    !(canAssignStrategyOwner ? String(strategyFormData.owner_userid || "").trim() : String(currentUserId || "").trim()) ||
+                    !String(strategyFormData.review_date || "").trim() ||
+                    !String(strategyFormData.deadline_time || "").trim() ||
+                    !String(strategyFormData.reminder_time || "").trim() ||
+                    !String(strategyFormData.priority || "").trim() ||
+                    !String(strategyFormData.state || "").trim()
+                  }
+                  className="px-6 py-2 rounded-full text-sm leading-none font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 disabled:opacity-40 transition flex items-center gap-2"
+                >
+                  {strategySaving ? "保存中..." : "新建"}
+                </button>
               </div>
             </div>
           </div>
@@ -4595,12 +5879,6 @@ function LibraryHoverPopover({
               chipClass: "text-[9px] px-2 py-0.5 bg-blue-100 text-blue-600 rounded-md font-semibold",
             },
             {
-              key: "tooth",
-              label: "齿形",
-              tags: hover.payload.toothTags,
-              chipClass: "text-[9px] px-2 py-0.5 bg-purple-100 text-purple-600 rounded-md font-semibold",
-            },
-            {
               key: "material",
               label: "材质",
               tags: hover.payload.materialTags,
@@ -4611,6 +5889,12 @@ function LibraryHoverPopover({
               label: "定位",
               tags: hover.payload.positionTags,
               chipClass: "text-[9px] px-2 py-0.5 bg-yellow-100 text-yellow-600 rounded-md font-semibold",
+            },
+            {
+              key: "tooth",
+              label: "其他",
+              tags: hover.payload.toothTags,
+              chipClass: "text-[9px] px-2 py-0.5 bg-purple-100 text-purple-600 rounded-md font-semibold",
             },
             {
               key: "custom",
@@ -4642,6 +5926,7 @@ function LibraryHoverPopover({
 
 type LibraryProductCardProps = {
   product: ProductLibraryItem;
+  prevItem?: BsrItem;
   siteFilter: string;
   selected: boolean;
   monthlySalesTrend?: MonthlyTrendPoint[];
@@ -4656,6 +5941,7 @@ type LibraryProductCardProps = {
 
 const LibraryProductCard = memo(function LibraryProductCard({
   product,
+  prevItem,
   siteFilter,
   selected,
   monthlySalesTrend,
@@ -4712,7 +5998,7 @@ const LibraryProductCard = memo(function LibraryProductCard({
       specLengthText: formatTextValue(product?.spec_length),
       specQuantityText,
       applicationTags: parseTagList(product?.application_tags),
-      toothTags: parseTagList(product?.tooth_pattern_tags),
+      toothTags: parseTagList(product?.other_tags),
       materialTags: parseTagList(product?.material_tags),
       positionTags: parseTagList(product?.position_tags_raw || product?.position_tags),
       customTags: parseTagList(product?.tags),
@@ -4749,6 +6035,19 @@ const LibraryProductCard = memo(function LibraryProductCard({
 
   const statusClass = statusColor[displayStatus] || "bg-gray-100 text-gray-600";
 
+  const rankChange = useMemo(() => {
+    const directRankChange = Number(bsr?.rank_change);
+    if (Number.isFinite(directRankChange)) {
+      return directRankChange;
+    }
+    const currentRank = Number(bsr?.bsr_rank ?? bsr?.rank);
+    const previousRank = Number(prevItem?.bsr_rank ?? prevItem?.rank);
+    if (!Number.isFinite(currentRank) || !Number.isFinite(previousRank)) {
+      return null;
+    }
+    return previousRank - currentRank;
+  }, [bsr?.rank_change, bsr?.bsr_rank, bsr?.rank, prevItem?.bsr_rank, prevItem?.rank]);
+
   const handleHoverShow = (target: HTMLElement) => {
     onHoverShow(target.getBoundingClientRect(), hoverPayload);
   };
@@ -4780,6 +6079,7 @@ const LibraryProductCard = memo(function LibraryProductCard({
               alt={displayTitle}
               className="w-full h-full object-contain"
               loading="lazy"
+              decoding="async"
               onError={() => setImageError(true)}
             />
           ) : (
@@ -4794,7 +6094,7 @@ const LibraryProductCard = memo(function LibraryProductCard({
             </span>
           </div>
           <div className="mt-1 flex items-center gap-2 text-[11px]">
-            <span className="font-black text-gray-900">{formatMoneyValue(bsr?.price)}</span>
+            <span className="font-black text-gray-900">{formatMoneyValue(bsr?.price, "-", displaySite)}</span>
             <span className="text-[#3B9DF8]">
               {"★★★★★".slice(0, Math.round(ratingValue))}
               <span className="text-gray-200">{"★★★★★".slice(Math.round(ratingValue))}</span>
@@ -4821,12 +6121,23 @@ const LibraryProductCard = memo(function LibraryProductCard({
         <div className="text-gray-400">
           变体数: <span className="text-gray-900 font-black">{formatNumberValue(bsr?.variation_count)}</span>
         </div>
-        <div />
+        <div className="text-gray-400">
+          排名变化:{" "}
+          {rankChange === null ? (
+            <span className="text-gray-400 font-black">-</span>
+          ) : rankChange > 0 ? (
+            <span className="text-green-600 font-black">↑ {formatNumberValue(rankChange)}</span>
+          ) : rankChange < 0 ? (
+            <span className="text-red-500 font-black">↓ {formatNumberValue(Math.abs(rankChange))}</span>
+          ) : (
+            <span className="text-gray-500 font-black">0</span>
+          )}
+        </div>
         <div className="text-gray-400">
           月销量: <span className="text-gray-900 font-black">{formatNumberValue(bsr?.sales_volume)}</span>
         </div>
         <div className="text-gray-400">
-          月销售额($): <span className="text-gray-900 font-black">{formatSalesMoneyValue(bsr?.sales)}</span>
+          月销售额({getCurrencySymbol(displaySite)}): <span className="text-gray-900 font-black">{formatSalesMoneyValue(bsr?.sales, "-", displaySite)}</span>
         </div>
       </div>
 
@@ -4856,7 +6167,7 @@ const LibraryProductCard = memo(function LibraryProductCard({
                 <span className="w-2 h-2 rounded-full bg-[#60A5FA]" />
                 <span>月销售额</span>
               </span>
-              <span>{formatSalesMoneyValue(hoveredSparklinePoint.salesAmount)}</span>
+              <span>{formatSalesMoneyValue(hoveredSparklinePoint.salesAmount, "-", displaySite)}</span>
             </div>
           </div>
         )}
@@ -4936,6 +6247,7 @@ interface SelectOption {
   value: string;
   label: string;
   sublabel?: string;
+  itemClassName?: string;
 }
 
 function CustomSelect({
@@ -4943,17 +6255,22 @@ function CustomSelect({
   onChange,
   options,
   labelPrefix,
+  placeholder,
   className = "",
   innerClassName = "",
+  editable = false,
 }: {
   value: string;
   onChange: (val: string) => void;
   options: (string | SelectOption)[];
   labelPrefix?: string;
+  placeholder?: string;
   className?: string;
   innerClassName?: string;
+  editable?: boolean;
 }) {
   const [isOpen, setIsOpen] = useState(false);
+  const [inputValue, setInputValue] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -4971,33 +6288,97 @@ function CustomSelect({
   );
 
   const selectedOption = normalizedOptions.find((opt) => opt.value === value);
+  const selectedDisplayText = (selectedOption?.label || value || "").trim().toLowerCase();
+  const filteredOptions = editable
+    ? normalizedOptions.filter((opt) => {
+      const rawKeyword = inputValue.trim().toLowerCase();
+      const keyword = rawKeyword === selectedDisplayText ? "" : rawKeyword;
+      if (!keyword) return true;
+      return opt.label.toLowerCase().includes(keyword) || opt.value.toLowerCase().includes(keyword);
+    })
+    : normalizedOptions;
+
+  useEffect(() => {
+    if (!editable) return;
+    setInputValue(selectedOption?.label || value || "");
+  }, [editable, selectedOption?.label, value]);
+
+  const commitEditableValue = () => {
+    if (!editable) return;
+    const next = inputValue.trim();
+    if (next && next !== value) {
+      onChange(next);
+    }
+  };
 
   return (
     <div className={`relative ${className}`} ref={containerRef}>
-      <button
-        type="button"
-        onClick={() => setIsOpen(!isOpen)}
-        className={`flex items-center justify-between px-3 py-2 bg-gray-50 border border-gray-100 rounded-xl text-xs font-bold text-gray-700 hover:bg-white hover:border-gray-200 transition-all w-full ${innerClassName}`}
-      >
-        <span className="truncate" title={selectedOption?.label || value}>
-          {labelPrefix}{selectedOption?.label || value}
-        </span>
-        <CaretDown size={12} className={`text-gray-400 transition-transform shrink-0 ml-1 ${isOpen ? "rotate-180" : ""}`} />
-      </button>
+      {editable ? (
+        <div
+          className={`flex items-center justify-between px-3 py-2 bg-gray-50 border border-gray-100 rounded-xl text-xs font-bold text-gray-700 hover:bg-white hover:border-gray-200 transition-all w-full ${innerClassName}`}
+        >
+          <input
+            value={inputValue}
+            onChange={(e) => {
+              setInputValue(e.target.value);
+              setIsOpen(true);
+            }}
+            onFocus={() => setIsOpen(true)}
+            onBlur={() => {
+              setTimeout(() => {
+                commitEditableValue();
+                setIsOpen(false);
+              }, 120);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitEditableValue();
+                setIsOpen(false);
+              }
+            }}
+            placeholder={placeholder || ""}
+            className="w-full bg-transparent outline-none text-xs font-bold text-gray-700 placeholder:text-gray-400"
+          />
+          <button
+            type="button"
+            onClick={() => setIsOpen((prev) => !prev)}
+            className="shrink-0 ml-1"
+          >
+            <CaretDown size={12} className={`text-gray-400 transition-transform ${isOpen ? "rotate-180" : ""}`} />
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setIsOpen(!isOpen)}
+          className={`flex items-center justify-between px-3 py-2 bg-gray-50 border border-gray-100 rounded-xl text-xs font-bold text-gray-700 hover:bg-white hover:border-gray-200 transition-all w-full ${innerClassName}`}
+        >
+          <span className={`truncate ${selectedOption?.label || value ? "" : "text-gray-400"}`} title={selectedOption?.label || value || placeholder || ""}>
+            {labelPrefix}{selectedOption?.label || value || placeholder || ""}
+          </span>
+          <CaretDown size={12} className={`text-gray-400 transition-transform shrink-0 ml-1 ${isOpen ? "rotate-180" : ""}`} />
+        </button>
+      )}
 
       {isOpen && (
         <div className="absolute top-full left-0 mt-0 z-[70] p-1.5 bg-white rounded-xl shadow-2xl border border-gray-100 animate-in fade-in slide-in-from-top-1 duration-200 w-full overflow-hidden">
           <div className="max-h-64 overflow-y-auto custom-scrollbar">
-            {normalizedOptions.map((opt) => (
+            {filteredOptions.map((opt) => (
               <button
                 key={opt.value}
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => {
+                  if (editable) {
+                    setInputValue(opt.label);
+                  }
                   onChange(opt.value);
                   setIsOpen(false);
                 }}
                 className={`w-full text-left px-3 py-2 rounded-lg transition-all mb-0.5 last:mb-0 ${value === opt.value
                   ? "bg-gray-900 text-white"
-                  : "text-gray-600 hover:bg-gray-50"
+                  : `${opt.itemClassName || "text-gray-600"} hover:bg-gray-50`
                   }`}
               >
                 <div className="text-xs font-bold truncate" title={opt.label}>
@@ -5017,6 +6398,100 @@ function CustomSelect({
   );
 }
 
+function CustomMultiSelect({
+  values,
+  onChange,
+  options,
+  placeholder = "请选择",
+  className = "",
+  innerClassName = "",
+}: {
+  values: string[];
+  onChange: (val: string[]) => void;
+  options: SelectOption[];
+  placeholder?: string;
+  className?: string;
+  innerClassName?: string;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const selectedSet = useMemo(() => new Set(values), [values]);
+  const selectedLabels = useMemo(
+    () => {
+      const labelsFromOptions = options
+        .filter((opt) => selectedSet.has(opt.value))
+        .map((opt) => opt.label)
+        .filter(Boolean);
+      const optionValueSet = new Set(options.map((opt) => opt.value));
+      const fallbackValues = values.filter((val) => val && !optionValueSet.has(val));
+      return [...labelsFromOptions, ...fallbackValues];
+    },
+    [options, selectedSet]
+  );
+
+  const toggleValue = (value: string) => {
+    const next = new Set(values);
+    if (next.has(value)) {
+      next.delete(value);
+    } else {
+      next.add(value);
+    }
+    onChange(Array.from(next));
+  };
+
+  return (
+    <div className={`relative ${className}`} ref={containerRef}>
+      <button
+        type="button"
+        onClick={() => setIsOpen((prev) => !prev)}
+        className={`flex items-center justify-between px-3 py-2 bg-gray-50 border border-gray-100 rounded-xl text-xs font-bold text-gray-700 hover:bg-white hover:border-gray-200 transition-all w-full ${innerClassName}`}
+      >
+        <span className="truncate text-left" title={selectedLabels.join(", ") || placeholder}>
+          {selectedLabels.length > 0 ? selectedLabels.join(", ") : placeholder}
+        </span>
+        <CaretDown size={12} className={`text-gray-400 transition-transform shrink-0 ml-1 ${isOpen ? "rotate-180" : ""}`} />
+      </button>
+
+      {isOpen && (
+        <div className="absolute top-full left-0 mt-0 z-[70] p-1.5 bg-white rounded-xl shadow-2xl border border-gray-100 animate-in fade-in slide-in-from-top-1 duration-200 w-full overflow-hidden">
+          <div className="max-h-64 overflow-y-auto custom-scrollbar">
+            {options.map((opt) => {
+              const checked = selectedSet.has(opt.value);
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => toggleValue(opt.value)}
+                  className={`w-full flex items-center justify-between text-left px-3 py-2 rounded-lg transition-all mb-0.5 last:mb-0 ${checked ? "bg-gray-900 text-white" : "text-gray-600 hover:bg-gray-50"}`}
+                >
+                  <span className="text-xs font-bold truncate pr-2" title={opt.label}>
+                    {opt.label}
+                  </span>
+                  {checked && <Check size={12} weight="bold" className="shrink-0" />}
+                </button>
+              );
+            })}
+            {options.length === 0 && (
+              <div className="px-3 py-2 text-xs text-gray-400">暂无可选参与人</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProductCard({
   item,
   prevItem,
@@ -5024,6 +6499,10 @@ function ProductCard({
   onMap,
   onCompare,
   onHistory,
+  enableTrendPrefetch = true,
+  detailItem,
+  detailLoading = false,
+  onRequestDetail,
   monthlySalesTrend,
   onRequestMonthlySalesTrend,
 }: {
@@ -5031,13 +6510,19 @@ function ProductCard({
   onTag?: (item: BsrItem) => void;
   onMap?: (item: BsrItem) => void;
   onCompare?: (item: BsrItem) => void;
-  onHistory?: (item: BsrItem, tab?: "month" | "child" | "price" | "keepa") => void;
+  onHistory?: (item: BsrItem, tab?: "month" | "child" | "daily" | "price" | "keepa") => void;
+  enableTrendPrefetch?: boolean;
+  detailItem?: BsrItem;
+  detailLoading?: boolean;
+  onRequestDetail?: (item: Pick<BsrItem, "asin" | "site" | "createtime" | "brand">) => Promise<BsrItem | null> | null;
   monthlySalesTrend?: MonthlyTrendPoint[];
   onRequestMonthlySalesTrend?: (item: BsrItem) => void;
   prevItem?: BsrItem;
 }) {
   const [imageError, setImageError] = useState(false);
   const [sparklineHoverIndex, setSparklineHoverIndex] = useState<number | null>(null);
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const detail = detailItem || null;
 
   const salesSparklinePoints = useMemo(() => {
     return buildSalesSparklinePoints({
@@ -5067,12 +6552,41 @@ function ProductCard({
     return salesSparklinePoints[sparklineHoverIndex];
   }, [sparklineHoverIndex, salesSparklinePoints]);
 
-  const organicTerms = toCountValue(item.organic_search_terms);
-  const adTerms = toCountValue(item.ad_search_terms);
-  const recommendTerms = toCountValue(item.search_recommend_terms);
+  useEffect(() => {
+    if (!enableTrendPrefetch) return;
+    if (monthlySalesTrend && monthlySalesTrend.length > 0) return;
+    if (!onRequestMonthlySalesTrend) return;
+    const node = cardRef.current;
+    if (!node) return;
+
+    let hasRequested = false;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const [entry] = entries;
+        if (!entry?.isIntersecting || hasRequested) return;
+        hasRequested = true;
+        onRequestMonthlySalesTrend(item);
+        observer.disconnect();
+      },
+      {
+        root: null,
+        rootMargin: "240px 0px",
+        threshold: 0.15,
+      },
+    );
+
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [enableTrendPrefetch, item, monthlySalesTrend, onRequestMonthlySalesTrend]);
+
+  const organicTerms = toCountValue(detail?.organic_search_terms);
+  const adTerms = toCountValue(detail?.ad_search_terms);
+  const recommendTerms = toCountValue(detail?.search_recommend_terms);
   const totalTerms = organicTerms + adTerms + recommendTerms;
-  const trafficShareText = formatTrafficShareValue(item.organic_traffic_count, item.ad_traffic_count, "organic");
-  const adTrafficShareText = formatTrafficShareValue(item.organic_traffic_count, item.ad_traffic_count, "ad");
+  const trafficShareText = formatTrafficShareValue(detail?.organic_traffic_count, detail?.ad_traffic_count, "organic");
+  const adTrafficShareText = formatTrafficShareValue(detail?.organic_traffic_count, detail?.ad_traffic_count, "ad");
 
   const renderTags = (value: unknown) => (
     <TagPillList
@@ -5091,29 +6605,93 @@ function ProductCard({
     return diffMs <= 180 * 24 * 60 * 60 * 1000;
   })();
 
-  const isDelta = (() => {
-    if (!prevItem) return false;
-    const currentSales = Number(item?.sales_volume);
-    const prevSales = Number(prevItem?.sales_volume);
-    const hasSalesGrowth =
-      Number.isFinite(currentSales) &&
-      Number.isFinite(prevSales) &&
-      (prevSales > 0 && (currentSales - prevSales) / prevSales > 0.2);
+  const isLimitedTimeDeal = (() => {
+    const raw = item?.is_limited_time_deal;
+    if (typeof raw === "boolean") return raw;
+    if (raw === null || raw === undefined) return false;
+    const normalized = String(raw).trim().toLowerCase();
+    return normalized === "1" || normalized === "true" || normalized === "yes";
+  })();
+
+  const priceDiffPercent = (() => {
+    const current = Number(String(item?.price ?? "").replace(/[^0-9.-]/g, ""));
+    const original = Number(String(item?.list_price ?? "").replace(/[^0-9.-]/g, ""));
+    if (!Number.isFinite(current) || !Number.isFinite(original) || original <= 0) return null;
+    const percent = Math.round(((current - original) / original) * 100);
+    if (percent === 0) return null;
+    return percent;
+  })();
+
+  const couponDiscountText = (() => {
+    const raw = detail?.coupon_discount;
+    if (raw === null || raw === undefined || raw === "") return "-";
+    const parsed = Number(String(raw).replace(/[^0-9.-]/g, ""));
+    if (!Number.isFinite(parsed)) return formatTextValue(raw);
+    return `${parsed}%`;
+  })();
+  const displaySite = String(item.site || "US").toUpperCase();
+  const couponPriceText = formatMoneyValue(detail?.coupon_price, "-", displaySite);
+  const hasCoupon = (() => {
+    const discount = Number(String(detail?.coupon_discount ?? "").replace(/[^0-9.-]/g, ""));
+    const price = Number(String(detail?.coupon_price ?? "").replace(/[^0-9.-]/g, ""));
+    const hasDiscount = Number.isFinite(discount) && discount > 0;
+    const hasPrice = Number.isFinite(price) && price > 0;
+    return hasDiscount || hasPrice;
+  })();
+
+  const deltaTags = (() => {
+    if (!prevItem) return [] as string[];
 
     const currentRank = Number(item?.bsr_rank ?? item?.rank);
     const prevRank = Number(prevItem?.bsr_rank ?? prevItem?.rank);
     const hasRankJump =
       Number.isFinite(currentRank) &&
       Number.isFinite(prevRank) &&
-      Math.abs(currentRank - prevRank) >= 10;
+      (prevRank - currentRank) >= 10;
 
-    return hasSalesGrowth || hasRankJump;
+    const currentSales = Number(item?.sales_volume);
+    const prevSales = Number(prevItem?.sales_volume);
+    const hasSalesGrowth =
+      Number.isFinite(currentSales) &&
+      Number.isFinite(prevSales) &&
+      prevSales > 0 &&
+      (currentSales - prevSales) / prevSales > 0.2;
+
+    if (hasSalesGrowth && hasRankJump) {
+      return ["增量-月销量-排名"];
+    }
+    if (hasSalesGrowth) {
+      return ["增量-月销量"];
+    }
+    if (hasRankJump) {
+      return ["增量-排名"];
+    }
+    return [] as string[];
+  })();
+  const isDelta = deltaTags.length > 0;
+
+  const rankChange = (() => {
+    const directRankChange = Number(item?.rank_change);
+    if (Number.isFinite(directRankChange)) {
+      return directRankChange;
+    }
+    const currentRank = Number(item?.bsr_rank ?? item?.rank);
+    const previousRank = Number(prevItem?.bsr_rank ?? prevItem?.rank);
+    if (!Number.isFinite(currentRank) || !Number.isFinite(previousRank)) {
+      return null;
+    }
+    // Smaller BSR rank is better; positive delta means ranking improved.
+    return previousRank - currentRank;
   })();
 
   return (
     <div
+      ref={cardRef}
       className={`rounded-3xl shadow-sm p-5 border relative flex flex-col h-full group overflow-visible card-hover-lift hover:z-30 ${isDelta ? "bg-red-50 border-red-300" : isNewProduct ? "bg-[#F6F8FF] border-[#3B9DF8]/40" : "bg-white border-gray-100"
         }`}
+      onMouseEnter={() => {
+        void onRequestDetail?.(item);
+      }}
     >
       {/* Top Section */}
       <div className="mb-4 min-h-[20px]" />
@@ -5121,11 +6699,11 @@ function ProductCard({
         <span className="text-xs font-bold text-white bg-[#1C1C1E] px-2 py-1 rounded-lg">
           #{formatTextValue(item.bsr_rank ?? item.rank)}
         </span>
-        {isDelta && (
-          <span className="text-xs font-bold text-white bg-red-500 px-2 py-1 rounded-lg">
-            增量
+        {deltaTags.map((tag) => (
+          <span key={tag} className="text-xs font-bold text-white bg-red-500 px-2 py-1 rounded-lg">
+            {tag}
           </span>
-        )}
+        ))}
         {isNewProduct && (
           <span className="text-xs font-bold text-white bg-[#3B9DF8] px-2 py-1 rounded-lg">
             新品
@@ -5142,6 +6720,7 @@ function ProductCard({
             className="w-full h-full object-contain"
             onError={() => setImageError(true)}
             loading="lazy"
+            decoding="async"
           />
         ) : (
           <div className="text-5xl filter drop-shadow-sm opacity-80">
@@ -5171,9 +6750,21 @@ function ProductCard({
 
       {/* Price */}
       <div className="flex items-center gap-2">
-        <span className="text-xs font-bold text-gray-900">{formatTextValue(item.price)}</span>
-        <span className="text-[11px] text-gray-400 line-through">{formatTextValue(item.list_price)}</span>
+        {priceDiffPercent !== null && (
+          <span className={`text-sm font-bold ${priceDiffPercent < 0 ? "text-red-500" : "text-green-600"}`}>
+            {priceDiffPercent > 0 ? "+" : ""}{priceDiffPercent}%
+          </span>
+        )}
+        <span className="text-xs font-bold text-gray-900">{formatMoneyValue(item.price, "-", displaySite)}</span>
+        <span className="text-[11px] text-gray-400 line-through">{formatMoneyValue(item.list_price, "-", displaySite)}</span>
       </div>
+          {hasCoupon && (
+        <div className="mt-1 mb-1">
+          <span className="inline-flex items-center px-2 py-0.5 rounded-sm bg-[#7ED957] text-[#1F3B1F] text-xs font-bold">
+            Apply {couponDiscountText} coupon {couponPriceText}
+          </span>
+        </div>
+      )}
 
       {/* Rating & reviews */}
       <div className="flex items-center gap-2 mb-4 mt-1">
@@ -5196,6 +6787,18 @@ function ProductCard({
         <div className="flex items-center gap-2">
           <span className="text-gray-500 font-semibold">父ASIN:</span>
           <span className="text-gray-900 font-bold">{formatTextValue(item.parent_asin)}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-gray-500 font-semibold">排名变化:</span>
+          {rankChange === null ? (
+            <span className="text-gray-400 font-bold">-</span>
+          ) : rankChange > 0 ? (
+            <span className="text-green-600 font-bold">↑ {formatNumberValue(rankChange)}</span>
+          ) : rankChange < 0 ? (
+            <span className="text-red-500 font-bold">↓ {formatNumberValue(Math.abs(rankChange))}</span>
+          ) : (
+            <span className="text-gray-500 font-bold">0</span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <span className="text-gray-500 font-semibold">变体数:</span>
@@ -5227,7 +6830,7 @@ function ProductCard({
             className="text-[#3B9DF8] font-bold underline decoration-dashed underline-offset-2 decoration-[#3B9DF8] hover:text-[#1D7FE0] hover:decoration-[#1D7FE0] transition-colors"
             title="查看历史销量"
           >
-            {formatSalesMoneyValue(item.sales)}
+            {formatSalesMoneyValue(item.sales, "-", displaySite)}
           </button>
         </div>
         <button
@@ -5255,7 +6858,7 @@ function ProductCard({
                   <span className="w-2 h-2 rounded-full bg-[#60A5FA]" />
                   <span>月销售额</span>
                 </span>
-                <span>{formatSalesMoneyValue(hoveredSparklinePoint.salesAmount)}</span>
+                <span>{formatSalesMoneyValue(hoveredSparklinePoint.salesAmount, "-", displaySite)}</span>
               </div>
             </div>
           )}
@@ -5304,23 +6907,32 @@ function ProductCard({
             <div className="h-full flex items-center text-[10px] text-gray-400">暂无历史数据</div>
           )}
         </button>
-        <div className="flex flex-wrap items-center gap-2 mt-2">
-          <a
-            href={`https://www.sif.com/search?asin=${encodeURIComponent(item.asin || "")}&type=1&country=${encodeURIComponent(item.site || "US")}`}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center px-2 py-0.5 rounded-md bg-[#F59E0B]/10 text-[#F59E0B] border border-[#F59E0B]/20 text-[10px] font-bold hover:bg-[#F59E0B]/20 transition"
-          >
-            流量结构分析
-          </a>
-          <a
-            href={`https://www.sif.com/reverse?country=${encodeURIComponent(item.site || "US")}&asin=${encodeURIComponent(item.asin || "")}&piece=latelyDay&date=7`}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center px-2 py-0.5 rounded-md bg-[#3B9DF8]/10 text-[#3B9DF8] border border-[#3B9DF8]/20 text-[10px] font-bold hover:bg-[#3B9DF8]/20 transition"
-          >
-            反查关键词
-          </a>
+        <div className="mt-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <a
+              href={`https://www.sif.com/search?asin=${encodeURIComponent(item.asin || "")}&type=1&country=${encodeURIComponent(item.site || "US")}`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center px-2 py-0.5 rounded-md bg-[#F59E0B]/10 text-[#F59E0B] border border-[#F59E0B]/20 text-[10px] font-bold hover:bg-[#F59E0B]/20 transition"
+            >
+              流量结构分析
+            </a>
+            <a
+              href={`https://www.sif.com/reverse?country=${encodeURIComponent(item.site || "US")}&asin=${encodeURIComponent(item.asin || "")}&piece=latelyDay&date=7`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center px-2 py-0.5 rounded-md bg-[#3B9DF8]/10 text-[#3B9DF8] border border-[#3B9DF8]/20 text-[10px] font-bold hover:bg-[#3B9DF8]/20 transition"
+            >
+              反查关键词
+            </a>
+          </div>
+          {isLimitedTimeDeal && (
+            <div className="mt-1">
+              <span className="inline-flex w-fit items-center px-2.5 py-1 rounded-md text-[12px] leading-none font-semibold text-white bg-[#D80B4A]">
+                Limited time deal
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -5338,20 +6950,26 @@ function ProductCard({
           <div className="flex justify-between items-center">
             <span>综合转化率</span>
             <span className="inline-flex items-center">
-              <ConversionRateBadge value={item.conversion_rate} period={item.conversion_rate_period} />
+              {detail ? (
+                <ConversionRateBadge value={detail.conversion_rate} period={detail.conversion_rate_period} />
+              ) : detailLoading ? (
+                <span className="text-gray-400">加载中...</span>
+              ) : (
+                <span className="text-gray-300">-</span>
+              )}
             </span>
           </div>
           <div className="flex justify-between items-center">
             <span>7天自然流量占比</span>
             <span className="bg-[#3B9DF8]/10 text-[#3B9DF8] font-bold px-2 py-0.5 rounded-lg">
-              {formatNumberValue(item.organic_traffic_count)}
+              {detail ? formatNumberValue(detail.organic_traffic_count) : detailLoading ? "..." : "-"}
               {trafficShareText}
             </span>
           </div>
           <div className="flex justify-between items-center">
             <span>7天广告流量占比</span>
             <span className="bg-orange-50 text-orange-600 font-bold px-2 py-0.5 rounded-lg">
-              {formatNumberValue(item.ad_traffic_count)}
+              {detail ? formatNumberValue(detail.ad_traffic_count) : detailLoading ? "..." : "-"}
               {adTrafficShareText}
             </span>
           </div>
@@ -5398,7 +7016,7 @@ function ProductCard({
           </div>
           <div className="flex items-center justify-between gap-2">
             <span>上架时间</span>
-            <span className="text-gray-900 font-bold">{formatTextValue(item.launch_date)}</span>
+            <span className="text-gray-900 font-bold">{formatTextValue(detail?.launch_date || item.launch_date)}</span>
           </div>
         </div>
       </div>

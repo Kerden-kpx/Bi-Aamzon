@@ -190,6 +190,8 @@ def import_bsr_data(
         merged_df.drop(columns=["sc_key"], inplace=True)
     if "asin_key" in merged_df.columns:
         merged_df.drop(columns=["asin_key"], inplace=True)
+    if "小类目" not in merged_df.columns:
+        raise ValueError("卖家精灵明细缺少'小类目'列，无法导入类目字段")
     if debug and debug_stage != "jimu_columns":
         _debug_df("merged_df", merged_df)
 
@@ -202,6 +204,7 @@ def import_bsr_data(
             "image_url": series_or_default(merged_df, "商品主图"),
             "product_url": series_or_default(merged_df, "商品详情页链接"),
             "brand": series_or_default(merged_df, "品牌"),
+            "category": series_or_default(merged_df, "小类目"),
             "price": series_numeric_or_default(merged_df, "价格($)"),
             "list_price": series_numeric_or_default(merged_df, "原价"),
             "score": series_numeric_or_default(merged_df, "评分"),
@@ -251,6 +254,7 @@ def import_bsr_data(
         "image_url",
         "product_url",
         "brand",
+        "category",
         "price",
         "list_price",
         "score",
@@ -274,7 +278,7 @@ def import_bsr_data(
     ]
 
     sql = f"""
-    INSERT INTO dim_bsr_item ({','.join(columns)})
+    INSERT INTO dim_bi_amazon_item ({','.join(columns)})
     VALUES ({','.join(['%s'] * len(columns))})
     ON DUPLICATE KEY UPDATE
     parent_asin=VALUES(parent_asin),
@@ -282,6 +286,7 @@ def import_bsr_data(
     image_url=VALUES(image_url),
     product_url=VALUES(product_url),
     brand=VALUES(brand),
+    category=VALUES(category),
     price=VALUES(price),
     list_price=VALUES(list_price),
     score=VALUES(score),

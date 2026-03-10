@@ -133,10 +133,10 @@ export function AppDatePicker({
 
       {isOpen && (
         <div
-          className={`absolute top-full ${align === "left" ? "left-0" : "right-0"} mt-2 z-[60] p-4 bg-white rounded-2xl shadow-2xl border border-gray-100 animate-in fade-in slide-in-from-top-2 duration-200`}
+          className={`absolute top-full ${align === "left" ? "left-0" : "right-0"} mt-2 z-[60] min-w-[284px] max-w-[calc(100vw-24px)] p-4 bg-white rounded-2xl shadow-2xl border border-gray-100 animate-in fade-in slide-in-from-top-2 duration-200`}
         >
           <div className="flex items-center justify-between mb-4 px-1">
-            <h4 className="text-sm font-black text-gray-900">
+            <h4 className="text-sm font-black text-gray-900 whitespace-nowrap">
               {viewDate.getFullYear()}年 {viewDate.getMonth() + 1}月
             </h4>
             <div className="flex gap-1">

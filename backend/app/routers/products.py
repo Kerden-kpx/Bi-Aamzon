@@ -38,7 +38,7 @@ def query_yida_products(
 ) -> Dict[str, Any]:
     limit = max(1, min(payload.limit, 2000))
     offset = max(0, payload.offset)
-    site = payload.site or "US"
+    site = payload.site
     items = product_service.list_products(
         site,
         limit,
@@ -46,6 +46,7 @@ def query_yida_products(
         current_user.role,
         current_user.userid,
         current_user.product_scope,
+        payload.q,
     )
     user_service.log_audit(
         module="product",
@@ -53,7 +54,7 @@ def query_yida_products(
         target_id=None,
         operator_userid=current_user.userid,
         operator_name=current_user.username,
-        detail=f"api=/api/yida-products/query, site={site}",
+        detail=f"api=/api/yida-products/query, site={site or 'ALL'}, q={payload.q or ''}",
     )
     return ok_response(list_response(items, limit, offset))
 

@@ -126,6 +126,7 @@ def _call_openrouter_bsr_ai_insight(
                 "coupon_price": to_float(row.get("coupon_price"), 0.0),
                 "coupon_discount": to_float(row.get("coupon_discount"), 0.0),
                 "child_sales": to_int(row.get("child_sales"), 0),
+                "sales_volume": to_int(row.get("sales_volume"), 0),
                 "fba_price": to_float(row.get("fba_price"), 0.0),
                 "fbm_price": to_float(row.get("fbm_price"), 0.0),
                 "strikethrough_price": to_float(row.get("strikethrough_price"), 0.0),
@@ -200,7 +201,7 @@ def get_bsr_ai_insight(asin: str, site: str, range_days: int) -> Dict[str, Any]:
     safe_range_days = range_days if range_days in {7, 30, 90, 180} else 90
     rows = bsr_repo.fetch_bsr_daily_window(target_asin, normalized_site, safe_range_days)
     if not rows:
-        raise HTTPException(status_code=404, detail="该 ASIN 在 fact_bsr_daily 暂无可分析数据")
+        raise HTTPException(status_code=404, detail="该 ASIN 在 fact_bi_amazon_product_day 暂无可分析数据")
     summary = _build_bsr_ai_summary(rows)
     report = _call_openrouter_bsr_ai_insight(target_asin, normalized_site, safe_range_days, rows, summary)
     return {

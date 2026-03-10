@@ -42,7 +42,7 @@ def run_ai_insight_job(
     try:
         rows = bsr_repo.fetch_bsr_daily_window(asin, site, range_days)
         if not rows:
-            raise HTTPException(status_code=404, detail="该 ASIN 在 fact_bsr_daily 暂无可分析数据")
+            raise HTTPException(status_code=404, detail="该 ASIN 在 fact_bi_amazon_product_day 暂无可分析数据")
         summary = bsr_ai_service._build_bsr_ai_summary(rows)
         report_text = bsr_ai_service._call_openrouter_bsr_ai_insight(asin, site, range_days, rows, summary)
         ai_insight_repo.mark_job_success(job_id, report_text)

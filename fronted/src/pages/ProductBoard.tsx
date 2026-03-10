@@ -6,14 +6,21 @@ import {
   Tag,
   CornersOut,
 } from "@phosphor-icons/react";
+import { Cascader } from "antd";
 import axios from "axios";
 import { useMemo, useState, useEffect, useRef, useCallback, type SetStateAction } from "react";
 
 import { AppDatePicker } from "../components/AppDatePicker";
 import { ConversionRateBadge } from "../components/ConversionRateBadge";
 import { FormInput, FormSelect } from "../components/FormControls";
+import { ProductCardSkeletons } from "../components/ProductCardSkeletons";
 import { TagManagerModal } from "../components/TagManagerModal";
 import { TagGroup, TagPillList, parseTagList } from "../components/TagSystem";
+import {
+  fetchCategoryTreeOptions,
+  findCategoryPathByLeaf,
+  getCategoryLeafFromPath,
+} from "../constants/productCategories";
 import { PRODUCT_STATUS_COLOR } from "../constants/productStatus";
 import {
   formatMoney,
@@ -34,8 +41,9 @@ type Product = {
   brand: string;
   name: string;
   product?: string;
+  category?: string;
   application_tags?: string;
-  tooth_pattern_tags?: string;
+  other_tags?: string;
   material_tags?: string;
   spec_length?: string;
   spec_quantity?: number;
@@ -49,39 +57,41 @@ type Product = {
 };
 
 type ProductBsr = {
-    site?: string;
-    parent_asin?: string;
-    brand?: string;
-    title?: string;
-    image_url?: string;
-    product_url?: string;
-    price?: string | number;
-    list_price?: string | number;
-    score?: number | string;
-    rating?: number | string;
-    comment_count?: number | string;
-    reviews?: number | string;
-    bsr_rank?: number | string;
-    rank?: number | string;
-    category_rank?: number | string;
-    variation_count?: number | string;
-    launch_date?: string;
-    conversion_rate?: number | string;
-    conversion_rate_period?: string;
-    organic_traffic_count?: number | string;
-    ad_traffic_count?: number | string;
-    organic_search_terms?: number | string;
-    ad_search_terms?: number | string;
-    search_recommend_terms?: number | string;
-    sales_volume?: number | string;
-    sales?: number | string;
-    tags?: string[] | string;
-    type?: string | number;
-    createtime?: string;
-    [key: string]: unknown;
+  site?: string;
+  parent_asin?: string;
+  brand?: string;
+  category?: string;
+  title?: string;
+  image_url?: string;
+  product_url?: string;
+  price?: string | number;
+  list_price?: string | number;
+  score?: number | string;
+  rating?: number | string;
+  comment_count?: number | string;
+  reviews?: number | string;
+  bsr_rank?: number | string;
+  prev_bsr_rank?: number | string;
+  rank?: number | string;
+  category_rank?: number | string;
+  variation_count?: number | string;
+  launch_date?: string;
+  conversion_rate?: number | string;
+  conversion_rate_period?: string;
+  organic_traffic_count?: number | string;
+  ad_traffic_count?: number | string;
+  organic_search_terms?: number | string;
+  ad_search_terms?: number | string;
+  search_recommend_terms?: number | string;
+  sales_volume?: number | string;
+  sales?: number | string;
+  tags?: string[] | string;
+  type?: string | number;
+  createtime?: string;
+  [key: string]: unknown;
 };
 
-type ProductFieldTagKey = "application_tags" | "tooth_pattern_tags" | "material_tags" | "position_tags";
+type ProductFieldTagKey = "application_tags" | "other_tags" | "material_tags" | "position_tags";
 type ProductFormData = Partial<Product> & { tagsStr?: string };
 type ProductApiItem = Partial<Product> & {
   bsr?: Partial<ProductBsr> | null;
@@ -116,7 +126,7 @@ const toNumberOrNull = (value: unknown, integer = false) => {
 
 const statusOptions = ["All", "Active", "Watch", "Paused"] as const;
 type StatusFilter = (typeof statusOptions)[number];
-const siteOptions = ["US", "CA", "UK", "DE"] as const;
+const siteOptions = ["US", "CA", "UK", "DE", "JP"] as const;
 
 const createEmptyBsrForm = () => ({
   site: "US",
@@ -152,6 +162,10 @@ export function ProductBoard({
   collapsed?: boolean;
   onToggleCollapse?: () => void;
 }) {
+  const [categoryTreeOptions, setCategoryTreeOptions] = useState<object[]>([]);
+  useEffect(() => {
+    fetchCategoryTreeOptions().then(setCategoryTreeOptions);
+  }, []);
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -162,6 +176,7 @@ export function ProductBoard({
   const [selectedSites, setSelectedSites] = useState<string[]>([...siteOptions]);
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const siteDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
   const handleToggleCollapse = () => onToggleCollapse?.();
   const handleToggleFullscreen = () => {
     if (document.fullscreenElement) {
@@ -186,15 +201,16 @@ export function ProductBoard({
   const [customLibraryTags, setCustomLibraryTags] = useState<string[]>([]);
   const [fieldTagModalOpen, setFieldTagModalOpen] = useState(false);
   const [activeFieldTag, setActiveFieldTag] = useState<ProductFieldTagKey | null>(null);
+  const modalCategoryCascaderRef = useRef<HTMLDivElement | null>(null);
   const [fieldCustomTags, setFieldCustomTags] = useState<Record<ProductFieldTagKey, string[]>>({
     application_tags: [],
-    tooth_pattern_tags: [],
+    other_tags: [],
     material_tags: [],
     position_tags: [],
   });
   const [fieldHiddenTags, setFieldHiddenTags] = useState<Record<ProductFieldTagKey, string[]>>({
     application_tags: [],
-    tooth_pattern_tags: [],
+    other_tags: [],
     material_tags: [],
     position_tags: [],
   });
@@ -211,7 +227,7 @@ export function ProductBoard({
     brand: "EZARC",
     status: "在售",
     application_tags: "",
-    tooth_pattern_tags: "",
+    other_tags: "",
     material_tags: "",
   });
 
@@ -241,8 +257,9 @@ export function ProductBoard({
       brand: String(item?.brand || ""),
       name: String(item?.name || item?.product || ""),
       product: item?.product ? String(item.product) : "",
+      category: String(item?.category || rawBsr?.category || ""),
       application_tags: item?.application_tags ? String(item.application_tags) : "",
-      tooth_pattern_tags: item?.tooth_pattern_tags ? String(item.tooth_pattern_tags) : "",
+      other_tags: item?.other_tags ? String(item.other_tags) : "",
       material_tags: item?.material_tags ? String(item.material_tags) : "",
       spec_length: item?.spec_length ? String(item.spec_length) : "",
       spec_quantity: Number.isFinite(specQuantity) ? specQuantity : undefined,
@@ -389,7 +406,7 @@ export function ProductBoard({
     };
     return {
       application_tags: build("application_tags"),
-      tooth_pattern_tags: build("tooth_pattern_tags"),
+      other_tags: build("other_tags"),
       material_tags: build("material_tags"),
       position_tags: build("position_tags"),
     };
@@ -397,7 +414,7 @@ export function ProductBoard({
 
   const fieldLabelMap: Record<ProductFieldTagKey, string> = {
     application_tags: "应用标签",
-    tooth_pattern_tags: "齿形标签",
+    other_tags: "其他标签",
     material_tags: "材质标签",
     position_tags: "定位标签",
   };
@@ -416,8 +433,7 @@ export function ProductBoard({
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-      if (!siteDropdownRef.current) return;
-      if (!siteDropdownRef.current.contains(event.target as Node)) {
+      if (siteDropdownRef.current && !siteDropdownRef.current.contains(event.target as Node)) {
         setSiteDropdownOpen(false);
       }
     };
@@ -427,9 +443,33 @@ export function ProductBoard({
     };
   }, []);
 
+  const categoryOptions = useMemo(() => {
+    const set = new Set<string>();
+    products.forEach((product) => {
+      const category = String(product.category || product.bsr?.category || "").trim();
+      if (category) {
+        set.add(category);
+      }
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+  }, [products]);
+
+  useEffect(() => {
+    setSelectedCategories((prev) => {
+      if (prev.length === 0) return prev;
+      const optionSet = new Set(categoryOptions);
+      const next = prev.filter((item) => optionSet.has(item));
+      if (next.length === prev.length && next.every((item, index) => item === prev[index])) {
+        return prev;
+      }
+      return next;
+    });
+  }, [categoryOptions]);
+
   const filteredProducts = useMemo(() => {
     // ... filtering logic ...
     const keyword = search.trim().toLowerCase();
+    const hasCategoryFilter = selectedCategories.length > 0;
     return products.filter((product) => {
       // Status mapping
       let matchesStatus = true;
@@ -448,9 +488,12 @@ export function ProductBoard({
         product.sku.toLowerCase().includes(keyword) ||
         product.asin.toLowerCase().includes(keyword);
 
-      return matchesStatus && matchesKeyword;
+      const productCategory = String(product.category || product.bsr?.category || "").trim();
+      const matchesCategory = !hasCategoryFilter || selectedCategories.includes(productCategory);
+
+      return matchesStatus && matchesKeyword && matchesCategory;
     });
-  }, [products, search, statusFilter]);
+  }, [products, search, statusFilter, selectedCategories, categoryOptions]);
 
   const stats = useMemo(() => {
     const total = products.length;
@@ -484,9 +527,10 @@ export function ProductBoard({
       asin: "",
       name: "",
       brand: "EZARC",
+      category: "",
       status: "在售",
       application_tags: "",
-      tooth_pattern_tags: "",
+      other_tags: "",
       material_tags: "",
       spec_length: "",
       spec_quantity: undefined,
@@ -562,8 +606,9 @@ export function ProductBoard({
       sku: String(formData.sku || "").trim(),
       brand: String(formData.brand || "").trim(),
       product: String(formData.name || "").trim(),
+      category: String(formData.category || "").trim() || null,
       application_tags: formData.application_tags?.trim() || null,
-      tooth_pattern_tags: formData.tooth_pattern_tags?.trim() || null,
+      other_tags: formData.other_tags?.trim() || null,
       material_tags: formData.material_tags?.trim() || null,
       spec_length: formData.spec_length?.trim() || null,
       spec_quantity: parsedSpecQuantity !== null && Number.isFinite(parsedSpecQuantity) ? parsedSpecQuantity : null,
@@ -590,6 +635,7 @@ export function ProductBoard({
       image_url: bsrForm.image_url?.trim() || null,
       product_url: bsrForm.product_url?.trim() || null,
       brand: bsrForm.brand?.trim() || formData.brand?.trim() || null,
+      category: String(formData.category || "").trim() || null,
       createtime: bsrForm.createtime?.trim() || null,
       price: toNumberOrNull(bsrForm.price),
       list_price: toNumberOrNull(bsrForm.list_price),
@@ -645,7 +691,8 @@ export function ProductBoard({
     setFormData((prev) => ({
       ...prev,
       name: prev.name || item.title || "",
-      brand: prev.brand || item.brand || prev.brand || "",
+      brand: item.brand || prev.brand || "",
+      category: prev.category || item.category || "",
     }));
   };
 
@@ -674,6 +721,7 @@ export function ProductBoard({
   const lookupBsrByAsin = async (asin: string) => {
     const trimmed = String(asin || "").trim();
     if (!trimmed) return;
+    if (trimmed.length !== 10) return;
     setBsrLookupLoading(true);
     setBsrLookupError(null);
     setBsrLookupSuccess(false);
@@ -682,17 +730,15 @@ export function ProductBoard({
       const res = await axios.post(`${apiBase}/api/bsr/lookup`, {
         asin: trimmed,
         site: String(bsrForm.site || "US").trim().toUpperCase() || "US",
-        brand: String(formData.brand || bsrForm.brand || "").trim() || undefined,
       });
       const lookupItem = res.data?.item as Partial<ProductBsr> | undefined;
       if (lookupItem) {
         fillBsrFormFromLookup(lookupItem);
         setBsrLookupSuccess(true);
       }
-    } catch (err: unknown) {
-      if (!(axios.isAxiosError(err) && err.response?.status === 404)) {
-        setBsrLookupError("自动填充失败，请检查后端服务。");
-      }
+    } catch {
+      // Lookup is best-effort; do not block manual create when unavailable.
+      setBsrLookupError(null);
     } finally {
       setBsrLookupLoading(false);
     }
@@ -700,7 +746,32 @@ export function ProductBoard({
 
   const saveProduct = async () => {
     const payload = buildPayload();
-    if (!payload.asin) {
+    if (modalMode === "add") {
+      const normalizedSite = String(payload.site || "").trim().toUpperCase();
+      const normalizedAsin = String(payload.asin || "").trim().toUpperCase();
+      const normalizedBrand = String(payload.brand || "").trim();
+      const normalizedProductName = String(payload.product || "").trim();
+      if (!normalizedSite) {
+        setFormError("Site 为必填项。");
+        return;
+      }
+      if (!normalizedAsin) {
+        setFormError("ASIN 为必填项。");
+        return;
+      }
+      if (!/^[A-Z0-9]{10}$/.test(normalizedAsin)) {
+        setFormError("ASIN 必须为10位字母或数字。");
+        return;
+      }
+      if (!normalizedBrand) {
+        setFormError("Brand 为必填项。");
+        return;
+      }
+      if (!normalizedProductName) {
+        setFormError("产品名称为必填项。");
+        return;
+      }
+    } else if (!payload.asin) {
       setFormError("ASIN 为必填项。");
       return;
     }
@@ -721,7 +792,15 @@ export function ProductBoard({
       }
       await fetchProducts();
       closeModal();
-    } catch {
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err)) {
+        const status = err.response?.status;
+        const detail = String(err.response?.data?.detail || "").toLowerCase();
+        if (modalMode === "add" && (status === 409 || detail.includes("already exists") || detail.includes("duplicate"))) {
+          setFormError("该产品已存在，不能重复新增。");
+          return;
+        }
+      }
       setFormError("保存失败，请检查后端服务或数据格式。");
     } finally {
       setSaving(false);
@@ -735,7 +814,7 @@ export function ProductBoard({
 
   const allSitesSelected = selectedSites.length === siteOptions.length;
   const selectedSiteLabel =
-    allSitesSelected || selectedSites.length === 0 ? "全部站点" : selectedSites.join(",");
+    allSitesSelected || selectedSites.length === 0 ? "ALL" : selectedSites.join(",");
 
   const toggleSiteSelection = (site: string) => {
     setSelectedSites((prev) => {
@@ -791,61 +870,84 @@ export function ProductBoard({
         </div>
 
         <div className="flex items-center gap-4">
-          <div className="relative w-[148px]" ref={siteDropdownRef}>
-            <button
-              type="button"
-              onClick={() => setSiteDropdownOpen((prev) => !prev)}
-              className="w-full h-9 px-3 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] transition"
-            >
-              <span className="truncate">{selectedSiteLabel}</span>
-              <CaretDown
-                size={14}
-                className={`text-[#7A8596] transition-transform ${siteDropdownOpen ? "rotate-180" : ""}`}
-              />
-            </button>
-            {siteDropdownOpen && (
-              <div className="absolute left-0 top-[42px] z-30 w-full rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2">
-                <label className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer">
-                  <input
-                    type="checkbox"
-                    className="h-4 w-4 accent-[#0C1731]"
-                    checked={allSitesSelected}
-                    onChange={() => {
-                      if (allSitesSelected) {
-                        setSelectedSites(["US"]);
-                      } else {
-                        setSelectedSites([...siteOptions]);
-                      }
-                    }}
-                  />
-                  全部站点
-                </label>
-                <div className="my-1 h-px bg-[#EEF2F7]" />
-                {siteOptions.map((site) => (
-                  <label
-                    key={site}
-                    className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
-                  >
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-gray-400">Site</span>
+            <div className="relative w-[148px]" ref={siteDropdownRef}>
+              <button
+                type="button"
+                onClick={() => setSiteDropdownOpen((prev) => !prev)}
+                className="w-full px-3 py-1.5 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] transition"
+              >
+                <span className="truncate">{selectedSiteLabel}</span>
+                <CaretDown
+                  size={14}
+                  className={`text-[#7A8596] transition-transform ${siteDropdownOpen ? "rotate-180" : ""}`}
+                />
+              </button>
+              {siteDropdownOpen && (
+                <div className="absolute left-0 top-full mt-2 z-30 w-full rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2">
+                  <label className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer">
                     <input
                       type="checkbox"
                       className="h-4 w-4 accent-[#0C1731]"
-                      checked={selectedSites.includes(site)}
-                      onChange={() => toggleSiteSelection(site)}
+                      checked={allSitesSelected}
+                      onChange={() => {
+                        if (allSitesSelected) {
+                          setSelectedSites(["US"]);
+                        } else {
+                          setSelectedSites([...siteOptions]);
+                        }
+                      }}
                     />
-                    {site}
+                    ALL
                   </label>
-                ))}
-              </div>
-            )}
+                  <div className="my-1 h-px bg-[#EEF2F7]" />
+                  {siteOptions.map((site) => (
+                    <label
+                      key={site}
+                      className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-[#0C1731]"
+                        checked={selectedSites.includes(site)}
+                        onChange={() => toggleSiteSelection(site)}
+                      />
+                      {site}
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-gray-400">Category</span>
+            <div className="w-[260px]">
+              <Cascader
+                options={categoryTreeOptions}
+                value={findCategoryPathByLeaf(String(selectedCategories[0] || "")) as any}
+                onChange={(value) => {
+                  const next = getCategoryLeafFromPath(value as string[]);
+                  setSelectedCategories(next ? [next] : []);
+                }}
+                placeholder="ALL"
+                allowClear
+                showSearch
+                placement="bottomLeft"
+                popupClassName="category-cascader-dropdown"
+                getPopupContainer={() => document.body}
+                className="w-full category-cascader product-header-category-cascader"
+              />
+            </div>
           </div>
           <div className="relative w-72">
-            <MagnifyingGlass className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+            <MagnifyingGlass className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={14} />
             <FormInput
               type="text"
               placeholder="搜索 产品名称, ASIN..."
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              className="h-[34px] pl-11 pr-4 text-xs rounded-full"
+              className="pl-9 pr-3 py-1.5 text-[13px] rounded-xl bg-[#F4F6FA] border-[#E9EDF3] hover:border-[#D5DBE6] text-[#3D4757]"
             />
           </div>
           <button
@@ -913,8 +1015,8 @@ export function ProductBoard({
         )}
 
         {loading ? (
-          <div className="py-16 text-center text-gray-400 bg-gray-50 rounded-2xl">
-            正在加载产品...
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-6">
+            <ProductCardSkeletons count={10} keyPrefix="products-skeleton" />
           </div>
         ) : filteredProducts.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-6">
@@ -970,64 +1072,87 @@ export function ProductBoard({
                 </div>
               </div>
               <div>
-                <label className="block text-sm font-bold text-gray-700 mb-2">品牌</label>
-                <div className="flex gap-3">
-                  {["EZARC", "TOLESA"].map((brand) => (
-                    <button
-                      key={brand}
-                      type="button"
-                      onClick={() => {
-                        setFormData((prev) => ({ ...prev, brand }));
-                        setBsrForm((prev) => ({ ...prev, brand }));
+                <label className="block text-sm font-bold text-gray-700 mb-2">类目</label>
+                <Cascader
+                  options={categoryTreeOptions}
+                  value={findCategoryPathByLeaf(String(formData.category || "")) as any}
+                  onChange={(value) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      category: getCategoryLeafFromPath(value as string[]),
+                    }))
+                  }
+                  placeholder="请选择一级/二级/三级分类"
+                  allowClear
+                  showSearch
+                  placement="bottomLeft"
+                  popupClassName="category-cascader-dropdown"
+                  getPopupContainer={() => document.body}
+                  className="w-full category-cascader"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-sm font-bold text-gray-700 mb-2">SKU</label>
+                    <FormInput
+                      value={formData.sku || ""}
+                      onChange={(e) => setFormData((prev) => ({ ...prev, sku: e.target.value }))}
+                      placeholder="SKU"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-bold text-gray-700 mb-2">ASIN</label>
+                    <FormInput
+                      value={formData.asin || ""}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setFormData((prev) => ({ ...prev, asin: value }));
+                        setBsrLookupSuccess(false);
+                        setBsrLookupError(null);
+                        if (!value.trim()) {
+                          setFormData((prev) => ({ ...prev, name: "", brand: "" }));
+                          setBsrForm((prev) => ({ ...createEmptyBsrForm(), brand: "", site: prev.site || "US" }));
+                          setBsrImageError(null);
+                          setBsrImageInputKey((prev) => prev + 1);
+                        }
                       }}
-                      className={`flex-1 py-2 px-4 rounded-xl text-sm font-bold transition-all border ${(
-                        formData.brand === brand
-                          ? "bg-gray-900 text-white border-gray-900 shadow-md scale-[1.02]"
-                          : "bg-gray-50 text-gray-500 border-gray-100 hover:bg-gray-100 hover:border-gray-200"
-                      )}`}
-                    >
-                      {brand}
-                    </button>
-                  ))}
+                      onBlur={(e) => lookupBsrByAsin(e.target.value)}
+                      placeholder={modalMode === "add" ? "填入ASIN自动填充数据" : "ASIN"}
+                      disabled={modalMode === "edit"}
+                    />
+                    {bsrLookupLoading && (
+                      <div className="text-xs text-gray-400 mt-1">正在查询 BSR 数据...</div>
+                    )}
+                    {bsrLookupSuccess && (
+                      <div className="text-xs text-green-600 mt-1">已自动填充 BSR 数据。</div>
+                    )}
+                    {bsrLookupError && (
+                      <div className="text-xs text-red-500 mt-1">{bsrLookupError}</div>
+                    )}
+                  </div>
+                  <div>
+                    <label className="block text-sm font-bold text-gray-700 mb-2">Brand</label>
+                    <div className="relative">
+                      <FormSelect
+                        value={formData.brand || ""}
+                        onChange={(e) => {
+                          const brand = e.target.value;
+                          setFormData((prev) => ({ ...prev, brand }));
+                          setBsrForm((prev) => ({ ...prev, brand }));
+                        }}
+                        className="pr-10 appearance-none"
+                      >
+                        <option value="EZARC">EZARC</option>
+                        <option value="TOLESA">TOLESA</option>
+                      </FormSelect>
+                      <CaretDown
+                        size={16}
+                        className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-gray-400"
+                      />
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <div>
-                <label className="block text-sm font-bold text-gray-700 mb-2">SKU</label>
-                <FormInput
-                  value={formData.sku || ""}
-                  onChange={(e) => setFormData((prev) => ({ ...prev, sku: e.target.value }))}
-                  placeholder="SKU"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-bold text-gray-700 mb-2">ASIN</label>
-                <FormInput
-                  value={formData.asin || ""}
-                  onChange={(e) => {
-                    const value = e.target.value;
-                    setFormData((prev) => ({ ...prev, asin: value }));
-                    setBsrLookupSuccess(false);
-                    setBsrLookupError(null);
-                    if (!value.trim()) {
-                      setFormData((prev) => ({ ...prev, name: "", brand: "" }));
-                      setBsrForm((prev) => ({ ...createEmptyBsrForm(), brand: "", site: prev.site || "US" }));
-                      setBsrImageError(null);
-                      setBsrImageInputKey((prev) => prev + 1);
-                    }
-                  }}
-                  onBlur={(e) => lookupBsrByAsin(e.target.value)}
-                  placeholder="ASIN"
-                  disabled={modalMode === "edit"}
-                />
-                {bsrLookupLoading && (
-                  <div className="text-xs text-gray-400 mt-1">正在查询 BSR 数据...</div>
-                )}
-                {bsrLookupSuccess && (
-                  <div className="text-xs text-green-600 mt-1">已自动填充 BSR 数据。</div>
-                )}
-                {bsrLookupError && (
-                  <div className="text-xs text-red-500 mt-1">{bsrLookupError}</div>
-                )}
               </div>
               <div className="md:col-span-2">
                 <label className="block text-sm font-bold text-gray-700 mb-2">产品名称</label>
@@ -1090,25 +1215,6 @@ export function ProductBoard({
               </div>
               <div className="md:col-span-2">
                 <div className="flex items-center justify-between mb-2">
-                  <label className="text-sm font-bold text-gray-700">齿形标签</label>
-                  <button
-                    type="button"
-                    onClick={() => openFieldTagModal("tooth_pattern_tags")}
-                    className="px-3 py-1.5 rounded-xl bg-gray-50 border border-gray-100 text-xs font-semibold text-gray-600 hover:bg-white hover:border-gray-200 transition-all"
-                  >
-                    管理标签
-                  </button>
-                </div>
-                <div className="flex flex-col gap-2">
-                  <TagPillList
-                    value={formData.tooth_pattern_tags}
-                    toneClass="bg-purple-100 text-purple-600"
-                    stack
-                  />
-                </div>
-              </div>
-              <div className="md:col-span-2">
-                <div className="flex items-center justify-between mb-2">
                   <label className="text-sm font-bold text-gray-700">材质标签</label>
                   <button
                     type="button"
@@ -1141,6 +1247,25 @@ export function ProductBoard({
                   <TagPillList
                     value={formData.position_tags}
                     toneClass="bg-yellow-100 text-yellow-600"
+                    stack
+                  />
+                </div>
+              </div>
+              <div className="md:col-span-2">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-bold text-gray-700">其他标签</label>
+                  <button
+                    type="button"
+                    onClick={() => openFieldTagModal("other_tags")}
+                    className="px-3 py-1.5 rounded-xl bg-gray-50 border border-gray-100 text-xs font-semibold text-gray-600 hover:bg-white hover:border-gray-200 transition-all"
+                  >
+                    管理标签
+                  </button>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <TagPillList
+                    value={formData.other_tags}
+                    toneClass="bg-purple-100 text-purple-600"
                     stack
                   />
                 </div>
@@ -1568,6 +1693,15 @@ function ProductCard({
   const totalTerms = organicTerms + adTerms + recommendTerms;
   const trafficShareText = formatTrafficShare(bsr?.organic_traffic_count, bsr?.ad_traffic_count, "organic");
   const adTrafficShareText = formatTrafficShare(bsr?.organic_traffic_count, bsr?.ad_traffic_count, "ad");
+  const rankChange = (() => {
+    const currentRank = Number(bsr?.bsr_rank ?? bsr?.rank);
+    const previousRank = Number(bsr?.prev_bsr_rank);
+    if (!Number.isFinite(currentRank) || !Number.isFinite(previousRank)) {
+      return null;
+    }
+    // Smaller BSR rank is better; positive delta means ranking improved.
+    return previousRank - currentRank;
+  })();
 
   return (
     <div className="bg-white rounded-3xl shadow-sm p-5 border border-gray-100 relative flex flex-col h-full group overflow-visible card-hover-lift hover:z-30">
@@ -1608,8 +1742,8 @@ function ProductCard({
         </h3>
       </div>
       <div className="flex items-center gap-2 mb-4">
-        <span className="text-xs font-bold text-gray-900">{formatMoney(bsr?.price)}</span>
-        <span className="text-[11px] text-gray-400 line-through">{formatMoney(bsr?.list_price)}</span>
+        <span className="text-xs font-bold text-gray-900">{formatMoney(bsr?.price, "-", product.site || bsr?.site || "US")}</span>
+        <span className="text-[11px] text-gray-400 line-through">{formatMoney(bsr?.list_price, "-", product.site || bsr?.site || "US")}</span>
         <div className="flex text-[#3B9DF8] text-[14px]">
           {"★★★★★".slice(0, ratingStars)}
           <span className="text-gray-200">{"★★★★★".slice(ratingStars)}</span>
@@ -1641,6 +1775,18 @@ function ProductCard({
           <span className="text-[11px] font-bold text-gray-500 uppercase tracking-tight whitespace-nowrap">SKU:</span>
           <span className="text-[11px] font-bold text-gray-900">{product.sku}</span>
         </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] font-bold text-gray-500 uppercase tracking-tight whitespace-nowrap">排名变化:</span>
+          {rankChange === null ? (
+            <span className="text-[11px] font-bold text-gray-400">-</span>
+          ) : rankChange > 0 ? (
+            <span className="text-[11px] font-bold text-green-600">↑ {formatNumber(rankChange)}</span>
+          ) : rankChange < 0 ? (
+            <span className="text-[11px] font-bold text-red-500">↓ {formatNumber(Math.abs(rankChange))}</span>
+          ) : (
+            <span className="text-[11px] font-bold text-gray-500">0</span>
+          )}
+        </div>
       </div>
 
       {/* Hover Details */}
@@ -1655,12 +1801,12 @@ function ProductCard({
               <span>大类排名</span>
               <span className="text-white bg-[#1C1C1E] px-2 py-0.5 rounded-lg font-bold">#{formatNumber(bsr?.category_rank)}</span>
             </div>
-          <div className="flex items-center justify-between">
-            <span>综合转化率</span>
-            <span className="inline-flex items-center">
-              <ConversionRateBadge value={bsr?.conversion_rate} period={bsr?.conversion_rate_period} />
-            </span>
-          </div>
+            <div className="flex items-center justify-between">
+              <span>综合转化率</span>
+              <span className="inline-flex items-center">
+                <ConversionRateBadge value={bsr?.conversion_rate} period={bsr?.conversion_rate_period} />
+              </span>
+            </div>
             <div className="flex items-center justify-between">
               <span>7天自然流量占比</span>
               <span className="bg-[#3B9DF8]/10 text-[#3B9DF8] font-bold px-2 py-0.5 rounded-lg">
@@ -1709,7 +1855,7 @@ function ProductCard({
             </div>
             <div className="flex items-center justify-between">
               <span>月销售额</span>
-              <span className="text-gray-900 font-bold">{formatSalesMoney(bsr?.sales)}</span>
+              <span className="text-gray-900 font-bold">{formatSalesMoney(bsr?.sales, "-", product.site || bsr?.site || "US")}</span>
             </div>
           </div>
           <div className="pt-2 border-t border-gray-100 space-y-3">
@@ -1726,7 +1872,7 @@ function ProductCard({
               />
               <TagGroup
                 label="齿形"
-                tags={parseTagList(product.tooth_pattern_tags)}
+                tags={parseTagList(product.other_tags)}
                 toneClass="bg-purple-50 text-purple-600 border border-purple-100/50"
               />
               <TagGroup

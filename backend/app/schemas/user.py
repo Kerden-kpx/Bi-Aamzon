@@ -34,3 +34,15 @@ class UserUpdatePayload(BaseModel):
 class ProductVisibilityPayload(BaseModel):
     product_scope: str = "all"
     asins: List[str] = Field(default_factory=list)
+
+
+class TeamCreatePayload(BaseModel):
+    team_name: str
+    lead_userid: str
+    member_userids: List[str] = Field(default_factory=list)
+
+
+class TeamUpdatePayload(BaseModel):
+    new_team_name: Optional[str] = None
+    lead_userid: str
+    member_userids: List[str] = Field(default_factory=list)

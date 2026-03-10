@@ -11,9 +11,10 @@ from ..schemas.bsr import (
     BsrAiInsightPayload,
     BsrDailyPayload,
     BsrDatesPayload,
-    BsrFetchDailyPayload,
     BsrLookupPayload,
+    BsrMonthlyBatchPayload,
     BsrMonthlyPayload,
+    BsrOverviewQueryPayload,
     BsrQueryPayload,
     MappingUpdatePayload,
     TagUpdatePayload,
@@ -28,10 +29,19 @@ def get_bsr_items(
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     createtime: Optional[date] = Query(None),
+    compare_date: Optional[date] = Query(None),
     site: str = Query("US"),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    result = bsr_service.list_bsr_items(limit, offset, createtime, site, current_user.role, current_user.userid)
+    result = bsr_service.list_bsr_items(
+        limit,
+        offset,
+        createtime,
+        compare_date,
+        site,
+        current_user.role,
+        current_user.userid,
+    )
     user_service.log_audit(
         module="bsr",
         action="visit",
@@ -51,7 +61,22 @@ def query_bsr_items(
     limit = max(1, min(payload.limit, 2000))
     offset = max(0, payload.offset)
     site = payload.site or "US"
-    result = bsr_service.list_bsr_items(limit, offset, payload.createtime, site, current_user.role, current_user.userid)
+    result = bsr_service.list_bsr_items(
+        limit,
+        offset,
+        payload.createtime,
+        payload.compare_date,
+        site,
+        current_user.role,
+        current_user.userid,
+        payload.brand_filters,
+        payload.rating_filters,
+        payload.tag_filters,
+        payload.category,
+        payload.price_min,
+        payload.price_max,
+        payload.compact,
+    )
     user_service.log_audit(
         module="bsr",
         action="visit",
@@ -61,6 +86,31 @@ def query_bsr_items(
         detail=f"api=/api/bsr/query, site={site}",
     )
     return ok_response(list_response(result["items"], limit, offset, batch_date=result.get("batch_date")))
+
+
+@router.post("/api/bsr/overview")
+def query_bsr_overview(
+    payload: BsrOverviewQueryPayload,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Dict[str, Any]:
+    site = payload.site or "US"
+    result = bsr_service.list_bsr_overview(
+        payload.createtime,
+        payload.compare_date,
+        site,
+        current_user.role,
+        current_user.userid,
+        payload.category,
+    )
+    user_service.log_audit(
+        module="overview",
+        action="visit",
+        target_id=None,
+        operator_userid=current_user.userid,
+        operator_name=current_user.username,
+        detail=f"api=/api/bsr/overview, site={site}",
+    )
+    return ok_response(result)
 
 
 @router.get("/api/bsr/lookup")
@@ -121,33 +171,6 @@ def import_bsr_files(
     return ok_response(result)
 
 
-@router.post("/api/bsr/fetch-daily")
-def fetch_bsr_daily(
-    payload: BsrFetchDailyPayload,
-    current_user: CurrentUser = Depends(get_current_user),
-) -> Dict[str, Any]:
-    site = payload.site or "US"
-    result = bsr_service.submit_export_daily_job(site, current_user.userid)
-    user_service.log_audit(
-        module="bsr",
-        action="fetch_daily_submit",
-        target_id=None,
-        operator_userid=current_user.userid,
-        operator_name=current_user.username,
-        detail=f"api=/api/bsr/fetch-daily, site={site}",
-    )
-    return ok_response(result)
-
-
-@router.get("/api/bsr/fetch-daily/jobs/{job_id}")
-def get_fetch_bsr_daily_job(
-    job_id: str,
-    current_user: CurrentUser = Depends(get_current_user),
-) -> Dict[str, Any]:
-    job = bsr_service.get_export_daily_job(job_id, current_user.userid, current_user.role)
-    return ok_response(job)
-
-
 @router.post("/api/bsr/monthly")
 def get_bsr_monthly(
     payload: BsrMonthlyPayload,
@@ -155,6 +178,15 @@ def get_bsr_monthly(
 ) -> Dict[str, Any]:
     rows = bsr_service.list_bsr_monthly(payload.asin, payload.site or "US", payload.is_child)
     return ok_response(list_response(rows))
+
+
+@router.post("/api/bsr/monthly/batch")
+def get_bsr_monthly_batch(
+    payload: BsrMonthlyBatchPayload,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Dict[str, Any]:
+    items = bsr_service.list_bsr_monthly_batch(payload.asins, payload.site or "US", payload.is_child)
+    return ok_response({"items": items})
 
 
 @router.post("/api/bsr/daily")

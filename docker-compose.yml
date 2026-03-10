@@ -3,31 +3,30 @@ services:
     image: redis:7-alpine
     container_name: bi-amazon-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
     volumes:
       - redis-data:/data
 
   backend:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile
     container_name: bi-amazon-backend
     restart: unless-stopped
     depends_on:
       - redis
     env_file:
-      - ./.env
+      - ./backend/.env
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
-    # Use host machine MySQL instead of a MySQL container.
-    # In backend/.env set DB_HOST=host.docker.internal (or host gateway IP).
+      STRATEGY_ATTACHMENT_ROOT: /app/uploads/strategy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./files:/app/files
-      - ./uploads:/app/uploads
+      - ./backend/files:/app/files
+      - ./backend/uploads:/app/uploads
+    expose:
+      - "18765"
     ports:
       - "18765:18765"
     healthcheck:
@@ -39,23 +38,38 @@ services:
 
   worker:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile
     container_name: bi-amazon-worker
     restart: unless-stopped
     depends_on:
       - redis
+      - backend
     env_file:
-      - ./.env
+      - ./backend/.env
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STRATEGY_ATTACHMENT_ROOT: /app/uploads/strategy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./files:/app/files
-      - ./uploads:/app/uploads
+      - ./backend/files:/app/files
+      - ./backend/uploads:/app/uploads
     command: ["celery", "-A", "app.core.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+
+  frontend:
+    build:
+      context: ./fronted
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ""
+    container_name: bi-amazon-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "6184:6184"
 
 volumes:
   redis-data:

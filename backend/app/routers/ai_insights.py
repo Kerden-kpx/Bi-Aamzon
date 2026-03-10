@@ -60,3 +60,24 @@ def query_ai_insight_jobs(
         current_user.userid,
     )
     return ok_response(list_response(items, limit, offset))
+
+
+@router.delete("/api/ai-insights/jobs/{job_id}")
+def delete_ai_insight_job(
+    job_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Dict[str, Any]:
+    from ..repositories import ai_insight_repo
+    affected = ai_insight_repo.delete_job(job_id, current_user.role, current_user.userid)
+    if affected == 0:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="任务不存在或无权限删除")
+    user_service.log_audit(
+        module="ai_insight",
+        action="delete",
+        target_id=job_id,
+        operator_userid=current_user.userid,
+        operator_name=current_user.username,
+        detail=f"job_id={job_id}",
+    )
+    return ok_response({"deleted": affected})

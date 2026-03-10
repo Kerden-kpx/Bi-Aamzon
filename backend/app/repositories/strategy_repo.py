@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from ..db import execute, execute_insert, fetch_all, fetch_one
 
@@ -14,11 +15,11 @@ def fetch_strategies(
     state: Optional[str],
     competitor_asin: Optional[str],
     yida_asin: Optional[str],
-    restrict_userid: Optional[str] = None,
+    visible_userids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     sql = """
         SELECT
-            s.id,
+            s.dingtalk_task_id AS id,
             s.competitor_asin,
             s.yida_asin,
             s.created_at,
@@ -27,14 +28,18 @@ def fetch_strategies(
             s.userid,
             s.owner_name,
             s.owner_userid,
+            s.participant_userids,
+            s.participant_names,
             s.review_date,
+            s.deadline_time,
+            s.reminder_time,
             s.priority,
             s.state,
             p.brand AS brand
-        FROM dim_bsr_strategy s
+        FROM dim_bi_amazon_todo s
         LEFT JOIN (
             SELECT asin, MAX(brand) AS brand
-            FROM dim_bsr_product
+            FROM dim_bi_amazon_product
             GROUP BY asin
         ) p ON p.asin = s.yida_asin
         WHERE 1=1
@@ -58,20 +63,24 @@ def fetch_strategies(
     if yida_asin:
         sql += " AND s.yida_asin = %s"
         params.append(yida_asin)
-    if restrict_userid:
-        sql += " AND (s.owner_userid = %s OR (s.owner_userid IS NULL AND s.userid = %s))"
-        params.extend([restrict_userid, restrict_userid])
+    if visible_userids is not None:
+        if not visible_userids:
+            sql += " AND 1 = 0"
+        else:
+            placeholders = ",".join(["%s"] * len(visible_userids))
+            sql += f" AND COALESCE(NULLIF(s.owner_userid, ''), s.userid) IN ({placeholders})"
+            params.extend(visible_userids)
 
-    sql += " ORDER BY s.created_at DESC, s.id DESC LIMIT %s OFFSET %s"
+    sql += " ORDER BY s.created_at DESC, s.dingtalk_task_id DESC LIMIT %s OFFSET %s"
     params.extend([limit, offset])
 
     return fetch_all(sql, params)
 
 
-def fetch_strategy_detail(strategy_id: int, restrict_userid: Optional[str]) -> Optional[Dict[str, Any]]:
+def fetch_strategy_detail(strategy_id: str, visible_userids: Optional[List[str]]) -> Optional[Dict[str, Any]]:
     sql = """
         SELECT
-            s.id,
+            s.dingtalk_task_id AS id,
             s.competitor_asin,
             s.yida_asin,
             s.created_at,
@@ -80,73 +89,144 @@ def fetch_strategy_detail(strategy_id: int, restrict_userid: Optional[str]) -> O
             s.userid,
             s.owner_name,
             s.owner_userid,
+            s.participant_userids,
+            s.participant_names,
             s.review_date,
+            s.deadline_time,
+            s.reminder_time,
             s.priority,
             s.state,
             p.brand AS brand
-        FROM dim_bsr_strategy s
+        FROM dim_bi_amazon_todo s
         LEFT JOIN (
             SELECT asin, MAX(brand) AS brand
-            FROM dim_bsr_product
+            FROM dim_bi_amazon_product
             GROUP BY asin
         ) p ON p.asin = s.yida_asin
-        WHERE s.id = %s
+        WHERE s.dingtalk_task_id = %s
         LIMIT 1
     """
     params: List[Any] = [strategy_id]
-    if restrict_userid:
-        sql = sql.replace("WHERE s.id = %s", "WHERE s.id = %s AND (s.owner_userid = %s OR (s.owner_userid IS NULL AND s.userid = %s))")
-        params.extend([restrict_userid, restrict_userid])
+    if visible_userids is not None:
+        if not visible_userids:
+            return None
+        placeholders = ",".join(["%s"] * len(visible_userids))
+        sql = sql.replace(
+            "WHERE s.dingtalk_task_id = %s",
+            f"WHERE s.dingtalk_task_id = %s AND COALESCE(NULLIF(s.owner_userid, ''), s.userid) IN ({placeholders})",
+        )
+        params.extend(visible_userids)
 
     return fetch_one(sql, params)
 
 
-def fetch_strategy_permission_row(strategy_id: int) -> Optional[Dict[str, Any]]:
+def fetch_strategy_permission_row(strategy_id: str) -> Optional[Dict[str, Any]]:
     return fetch_one(
-        "SELECT id, userid, owner_userid, owner_name FROM dim_bsr_strategy WHERE id = %s LIMIT 1",
+        """
+        SELECT
+            dingtalk_task_id AS id,
+            userid,
+            owner_userid,
+            owner_name,
+            participant_userids,
+            participant_names,
+            deadline_time,
+            reminder_time
+        FROM dim_bi_amazon_todo
+        WHERE dingtalk_task_id = %s
+        LIMIT 1
+        """,
         (strategy_id,),
     )
 
 
-def insert_strategy(params: Tuple[Any, ...]) -> int:
+def insert_strategy(params: Tuple[Any, ...]) -> str:
+    local_task_id = f"local_{uuid4().hex}"
     sql = """
-        INSERT INTO dim_bsr_strategy (
-            competitor_asin, yida_asin, created_at,
-            title, detail, userid, owner_name, owner_userid, review_date,
-            priority, state, updated_by
+        INSERT INTO dim_bi_amazon_todo (
+            site, competitor_asin, yida_asin, userid,
+            title, detail, owner_userid, owner_name, participant_userids, participant_names, review_date,
+            deadline_time, reminder_time,
+            priority, state, dingtalk_task_id, created_at, updated_by
         ) VALUES (
-            %s, %s, COALESCE(%s, CURDATE()),
-            %s, %s, %s, %s, %s, %s,
-            %s, COALESCE(%s, '待开始'), %s
+            %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s,
+            %s, COALESCE(%s, '待开始'), %s, COALESCE(%s, CURDATE()), %s
         )
     """
-    return execute_insert(sql, params)
+    (
+        competitor_asin,
+        yida_asin,
+        created_at,
+        title,
+        detail,
+        userid,
+        owner_name,
+        owner_userid,
+        participant_userids,
+        participant_names,
+        review_date,
+        deadline_time,
+        reminder_time,
+        priority,
+        state,
+        updated_by,
+    ) = params
+    execute_insert(
+        sql,
+        (
+            "US",
+            competitor_asin,
+            yida_asin,
+            userid,
+            title,
+            detail,
+            owner_userid,
+            owner_name,
+            participant_userids,
+            participant_names,
+            review_date,
+            deadline_time,
+            reminder_time,
+            priority,
+            state,
+            local_task_id,
+            created_at,
+            updated_by,
+        ),
+    )
+    return local_task_id
 
 
-def update_strategy_state(strategy_id: int, state: str, updated_by: str) -> int:
+def update_strategy_state(strategy_id: str, state: str, updated_by: str) -> int:
     return execute(
-        "UPDATE dim_bsr_strategy SET state = %s, updated_by = %s WHERE id = %s",
+        "UPDATE dim_bi_amazon_todo SET state = %s, updated_by = %s WHERE dingtalk_task_id = %s",
         (state, updated_by, strategy_id),
     )
 
 
 def update_strategy(params: Tuple[Any, ...]) -> int:
     sql = """
-        UPDATE dim_bsr_strategy
+        UPDATE dim_bi_amazon_todo
         SET
             yida_asin = %s,
             title = %s,
             detail = %s,
             owner_name = %s,
             owner_userid = %s,
+            participant_userids = %s,
+            participant_names = %s,
             review_date = %s,
+            deadline_time = %s,
+            reminder_time = %s,
             priority = %s,
             state = %s,
             updated_by = %s
-        WHERE id = %s
+        WHERE dingtalk_task_id = %s
     """
     return execute(sql, params)
 
 
-def delete_strategy(strategy_id: int) -> int:
-    return execute("DELETE FROM dim_bsr_strategy WHERE id = %s", (strategy_id,))
+def delete_strategy(strategy_id: str) -> int:
+    return execute("DELETE FROM dim_bi_amazon_todo WHERE dingtalk_task_id = %s", (strategy_id,))

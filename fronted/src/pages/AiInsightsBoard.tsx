@@ -1,4 +1,4 @@
-import { CaretDown, CornersOut, MagnifyingGlass, SidebarSimple, Star } from "@phosphor-icons/react";
+import { CaretDown, CornersOut, MagnifyingGlass, SidebarSimple, Star, Trash } from "@phosphor-icons/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -14,7 +14,7 @@ type JobItem = {
   report_preview?: string;
 };
 
-const siteOptions = ["US", "CA", "UK", "DE"];
+const siteOptions = ["US", "CA", "UK", "DE", "JP"];
 function formatTime(value?: string) {
   if (!value) return "-";
   const d = new Date(value);
@@ -39,6 +39,8 @@ export function AiInsightsBoard({
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const siteDropdownRef = useRef<HTMLDivElement | null>(null);
   const [selectedJobId, setSelectedJobId] = useState<string>("");
+  const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   const handleToggleCollapse = () => onToggleCollapse?.();
   const handleToggleFullscreen = () => {
@@ -57,7 +59,7 @@ export function AiInsightsBoard({
   }, [asinFilter]);
 
   const loadJobs = useCallback(async () => {
-    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+    const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || "";
     setLoading(true);
     setError(null);
     try {
@@ -90,7 +92,7 @@ export function AiInsightsBoard({
   }, [loadJobs]);
 
   const allSitesSelected = selectedSites.length === siteOptions.length;
-  const selectedSiteLabel = allSitesSelected || selectedSites.length === 0 ? "全部站点" : selectedSites.join(",");
+  const selectedSiteLabel = allSitesSelected || selectedSites.length === 0 ? "ALL" : selectedSites.join(",");
 
   const filteredJobs = useMemo(() => {
     const allowed = new Set(selectedSites.map((site) => String(site || "").toUpperCase()));
@@ -141,6 +143,35 @@ export function AiInsightsBoard({
     });
   };
 
+  const handleDeleteClick = (e: React.MouseEvent, jobId: string) => {
+    e.stopPropagation();
+    setConfirmDeleteId(jobId);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!confirmDeleteId) return;
+    const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || "";
+    setDeletingJobId(confirmDeleteId);
+    setConfirmDeleteId(null);
+    try {
+      const res = await fetch(`${apiBase}/api/ai-insights/jobs/${confirmDeleteId}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const message = data?.detail || data?.error?.message || `HTTP ${res.status}`;
+        throw new Error(message);
+      }
+      // 从本地列表移除，避免重新请求
+      setJobs((prev) => prev.filter((j) => j.job_id !== confirmDeleteId));
+      if (selectedJobId === confirmDeleteId) setSelectedJobId("");
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "删除失败");
+    } finally {
+      setDeletingJobId(null);
+    }
+  };
+
   return (
     <main className={`flex-1 ${collapsed ? "ml-20" : "ml-56"} p-8 transition-all duration-300 bg-[#F7F9FB] h-screen overflow-hidden text-gray-800 flex flex-col`}>
       <header className="flex justify-between items-center mb-6">
@@ -159,60 +190,63 @@ export function AiInsightsBoard({
           <span className="text-gray-900 font-medium">AI Insights</span>
         </div>
         <div className="flex items-center gap-3">
-          <div className="relative w-[148px]" ref={siteDropdownRef}>
-            <button
-              type="button"
-              onClick={() => setSiteDropdownOpen((prev) => !prev)}
-              className="w-full h-9 px-3 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] transition"
-            >
-              <span className="truncate">{selectedSiteLabel}</span>
-              <CaretDown
-                size={14}
-                className={`text-[#7A8596] transition-transform ${siteDropdownOpen ? "rotate-180" : ""}`}
-              />
-            </button>
-            {siteDropdownOpen && (
-              <div className="absolute left-0 top-[42px] z-30 w-full rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2">
-                <label className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer">
-                  <input
-                    type="checkbox"
-                    className="h-4 w-4 accent-[#0C1731]"
-                    checked={allSitesSelected}
-                    onChange={() => {
-                      if (allSitesSelected) {
-                        setSelectedSites(["US"]);
-                      } else {
-                        setSelectedSites([...siteOptions]);
-                      }
-                    }}
-                  />
-                  全部站点
-                </label>
-                <div className="my-1 h-px bg-[#EEF2F7]" />
-                {siteOptions.map((site) => (
-                  <label
-                    key={site}
-                    className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
-                  >
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-gray-400">Site</span>
+            <div className="relative w-[148px]" ref={siteDropdownRef}>
+              <button
+                type="button"
+                onClick={() => setSiteDropdownOpen((prev) => !prev)}
+                className="w-full px-3 py-1.5 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] transition"
+              >
+                <span className="truncate">{selectedSiteLabel}</span>
+                <CaretDown
+                  size={14}
+                  className={`text-[#7A8596] transition-transform ${siteDropdownOpen ? "rotate-180" : ""}`}
+                />
+              </button>
+              {siteDropdownOpen && (
+                <div className="absolute left-0 top-full mt-2 z-30 w-full rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2">
+                  <label className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer">
                     <input
                       type="checkbox"
                       className="h-4 w-4 accent-[#0C1731]"
-                      checked={selectedSites.includes(site)}
-                      onChange={() => toggleSiteSelection(site)}
+                      checked={allSitesSelected}
+                      onChange={() => {
+                        if (allSitesSelected) {
+                          setSelectedSites(["US"]);
+                        } else {
+                          setSelectedSites([...siteOptions]);
+                        }
+                      }}
                     />
-                    {site}
+                    ALL
                   </label>
-                ))}
-              </div>
-            )}
+                  <div className="my-1 h-px bg-[#EEF2F7]" />
+                  {siteOptions.map((site) => (
+                    <label
+                      key={site}
+                      className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-[#0C1731]"
+                        checked={selectedSites.includes(site)}
+                        onChange={() => toggleSiteSelection(site)}
+                      />
+                      {site}
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
           <div className="relative w-72">
-            <MagnifyingGlass className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+            <MagnifyingGlass className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
             <input
               value={asinFilter}
               onChange={(e) => setAsinFilter(e.target.value)}
               placeholder="搜索 ASIN"
-              className="w-full h-[34px] pl-11 pr-4 text-xs rounded-full bg-[#F4F6FA] border border-[#E9EDF3] outline-none focus:border-blue-300"
+              className="w-full pl-9 pr-3 py-2 rounded-xl bg-gray-50 hover:bg-gray-100 text-sm text-gray-700 transition outline-none focus:ring-2 focus:ring-[#3B9DF8]/30"
             />
           </div>
           <button
@@ -225,7 +259,32 @@ export function AiInsightsBoard({
         </div>
       </header>
 
-      <section className="grid items-start lg:items-stretch grid-cols-1 lg:grid-cols-[minmax(360px,420px)_minmax(0,1fr)] gap-6 flex-1 min-h-0">
+      {/* 删除确认弹窗 */}
+      {confirmDeleteId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
+          <div className="bg-white rounded-2xl shadow-xl p-6 w-80 flex flex-col gap-4">
+            <p className="text-sm text-gray-700 text-center">确认删除该任务记录？此操作不可恢复。</p>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteId(null)}
+                className="flex-1 py-2 rounded-xl border border-gray-200 text-sm text-gray-600 hover:bg-gray-50 transition"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                className="flex-1 py-2 rounded-xl bg-red-500 text-sm text-white hover:bg-red-600 transition"
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <section className="grid items-start lg:items-stretch grid-cols-1 lg:grid-cols-[minmax(420px,520px)_minmax(0,1fr)] gap-6 flex-1 min-h-0">
         <div className="bg-white p-5 rounded-3xl shadow-sm lg:h-full min-h-[320px] lg:min-h-0 flex flex-col">
           {loading && (
             <div className="flex-1 min-h-0 flex items-center justify-center text-sm text-gray-400">
@@ -243,23 +302,39 @@ export function AiInsightsBoard({
               <table className="w-full text-sm table-auto">
                 <thead className="text-xs text-gray-400">
                   <tr>
-                    <th className="text-center font-normal py-3 px-2 w-[72px]">序号</th>
-                    <th className="text-center font-normal py-3 px-2 w-[64px]">站点</th>
-                    <th className="text-center font-normal py-3 px-2 w-[140px]">ASIN</th>
-                    <th className="text-center font-normal py-3 px-2 w-[190px] whitespace-nowrap">创建时间</th>
+                    <th className="text-center font-normal py-3 px-2 w-[52px]">序号</th>
+                    <th className="text-center font-normal py-3 px-2 w-[54px]">站点</th>
+                    <th className="text-center font-normal py-3 px-2 w-[120px]">ASIN</th>
+                    <th className="text-center font-normal py-3 px-2 w-[170px] whitespace-nowrap">创建时间</th>
+                    <th className="text-center font-normal py-3 px-2 w-[40px]"></th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
                   {filteredJobs.map((item, index) => (
                     <tr
                       key={item.job_id}
-                      className={`cursor-pointer hover:bg-gray-50 ${selectedJobId === item.job_id ? "bg-blue-50/40" : ""}`}
+                      className={`cursor-pointer hover:bg-gray-50 group ${selectedJobId === item.job_id ? "bg-blue-50/40" : ""}`}
                       onClick={() => setSelectedJobId(item.job_id)}
                     >
                       <td className="py-3 px-2 text-gray-900 text-center">{index + 1}</td>
                       <td className="py-3 px-2 text-gray-900 text-center">{item.site}</td>
                       <td className="py-3 px-2 text-gray-900 font-medium text-center">{item.asin}</td>
                       <td className="py-3 px-2 text-gray-900 text-center whitespace-nowrap">{formatTime(item.created_at)}</td>
+                      <td className="py-2 px-2 text-center">
+                        <button
+                          type="button"
+                          title="删除"
+                          disabled={deletingJobId === item.job_id}
+                          onClick={(e) => handleDeleteClick(e, item.job_id)}
+                          className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded-lg hover:bg-red-50 text-gray-300 hover:text-red-500 disabled:opacity-30"
+                        >
+                          {deletingJobId === item.job_id ? (
+                            <span className="block w-4 h-4 border-2 border-red-400 border-t-transparent rounded-full animate-spin" />
+                          ) : (
+                            <Trash size={15} />
+                          )}
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>

@@ -2,6 +2,7 @@ import axios from "axios";
 
 let fetchWrapped = false;
 let activeAuthToken = "";
+let authResetInProgress = false;
 
 const purgeStoredAuth = () => {
   if (typeof window === "undefined") return;
@@ -21,6 +22,25 @@ const withApiBase = (path: string) => {
 };
 
 const DEFAULT_AUTH_TIMEOUT_MS = Number(import.meta.env.VITE_DINGTALK_AUTH_TIMEOUT_MS || 8000);
+const DEBUG_ACTOR_STORAGE_KEY = "debug_actor_override";
+const TEST_MODE_ENABLED = String(import.meta.env.VITE_ENABLE_TEST_MODE || "")
+  .trim()
+  .toLowerCase() === "true";
+
+export const syncDebugActorHeader = () => {
+  if (!TEST_MODE_ENABLED) {
+    delete axios.defaults.headers.common["X-Debug-Actor"];
+    return;
+  }
+  const debugActor = typeof window !== "undefined"
+    ? String(window.localStorage.getItem(DEBUG_ACTOR_STORAGE_KEY) || "").trim().toLowerCase()
+    : "";
+  if (debugActor === "user_a" || debugActor === "user_b") {
+    axios.defaults.headers.common["X-Debug-Actor"] = debugActor;
+  } else {
+    delete axios.defaults.headers.common["X-Debug-Actor"];
+  }
+};
 
 const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, stage: string): Promise<T> => {
   let timer = 0;
@@ -42,6 +62,7 @@ export const applyAuthToken = (token: string) => {
   if (!token) return;
   activeAuthToken = token;
   axios.defaults.headers.common.Authorization = `Bearer ${token}`;
+  syncDebugActorHeader();
   if (fetchWrapped || typeof window === "undefined") return;
   const originalFetch = window.fetch.bind(window);
   window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
@@ -49,10 +70,26 @@ export const applyAuthToken = (token: string) => {
     if (!headers.has("Authorization") && activeAuthToken) {
       headers.set("Authorization", `Bearer ${activeAuthToken}`);
     }
+    if (TEST_MODE_ENABLED) {
+      const debugActorValue = String(window.localStorage.getItem(DEBUG_ACTOR_STORAGE_KEY) || "").trim().toLowerCase();
+      if (debugActorValue === "user_a" || debugActorValue === "user_b") {
+        headers.set("X-Debug-Actor", debugActorValue);
+      } else {
+        headers.delete("X-Debug-Actor");
+      }
+    } else {
+      headers.delete("X-Debug-Actor");
+    }
     return originalFetch(input, { ...init, headers }).then((response) => {
       if (response.status === 401) {
         clearAuthToken();
         purgeStoredAuth();
+        if (!authResetInProgress && typeof window !== "undefined") {
+          authResetInProgress = true;
+          window.setTimeout(() => {
+            window.location.reload();
+          }, 50);
+        }
       }
       return response;
     });
@@ -63,6 +100,7 @@ export const applyAuthToken = (token: string) => {
 export const clearAuthToken = () => {
   activeAuthToken = "";
   delete axios.defaults.headers.common.Authorization;
+  delete axios.defaults.headers.common["X-Debug-Actor"];
 };
 
 const getAuthCode = (corpId: string) =>

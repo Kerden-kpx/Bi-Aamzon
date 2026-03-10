@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Annotated, Literal, Optional
+from typing import Annotated, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 AsinCode = Annotated[
     str,
@@ -16,37 +16,10 @@ OwnerUserIdText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._@-]+$"),
 ]
-StrategyPriority = Literal["高", "中", "低"]
-StrategyState = Literal["待开始", "进行中", "已完成", "已暂停", "已取消"]
-
-_PRIORITY_ALIASES = {
-    "高": "高",
-    "中": "中",
-    "低": "低",
-    "p0": "高",
-    "p1": "中",
-    "p2": "低",
-    "high": "高",
-    "medium": "中",
-    "low": "低",
-}
-_STATE_ALIASES = {
-    "待开始": "待开始",
-    "todo": "待开始",
-    "pending": "待开始",
-    "进行中": "进行中",
-    "doing": "进行中",
-    "in_progress": "进行中",
-    "已完成": "已完成",
-    "done": "已完成",
-    "completed": "已完成",
-    "已暂停": "已暂停",
-    "paused": "已暂停",
-    "on_hold": "已暂停",
-    "已取消": "已取消",
-    "cancelled": "已取消",
-    "canceled": "已取消",
-}
+DeadlineTimeText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=16)]
+ReminderTimeText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
+StrategyPriority = Literal["较低", "普通", "较高", "紧急"]
+StrategyState = Literal["待开始", "进行中", "已完成", "搁置"]
 
 
 class StrategyPayload(BaseModel):
@@ -59,39 +32,18 @@ class StrategyPayload(BaseModel):
     detail: DetailText
     owner: Optional[ShortText] = None
     owner_userid: Optional[OwnerUserIdText] = None
+    participant_userids: Optional[List[OwnerUserIdText]] = None
     review_date: Optional[date] = None
+    deadline_time: Optional[DeadlineTimeText] = None
+    reminder_time: Optional[ReminderTimeText] = None
     priority: StrategyPriority
     state: Optional[StrategyState] = None
-
-    @field_validator("priority", mode="before")
-    @classmethod
-    def _normalize_priority(cls, value):
-        if value is None:
-            return value
-        raw = str(value).strip().lower()
-        return _PRIORITY_ALIASES.get(raw, value)
-
-    @field_validator("state", mode="before")
-    @classmethod
-    def _normalize_state(cls, value):
-        if value is None:
-            return value
-        raw = str(value).strip().lower()
-        return _STATE_ALIASES.get(raw, value)
 
 
 class StrategyStatePayload(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     state: StrategyState
-
-    @field_validator("state", mode="before")
-    @classmethod
-    def _normalize_state(cls, value):
-        if value is None:
-            return value
-        raw = str(value).strip().lower()
-        return _STATE_ALIASES.get(raw, value)
 
 
 class StrategyUpdatePayload(BaseModel):
@@ -102,25 +54,12 @@ class StrategyUpdatePayload(BaseModel):
     detail: DetailText
     owner: Optional[ShortText] = None
     owner_userid: Optional[OwnerUserIdText] = None
+    participant_userids: Optional[List[OwnerUserIdText]] = None
     review_date: Optional[date] = None
+    deadline_time: Optional[DeadlineTimeText] = None
+    reminder_time: Optional[ReminderTimeText] = None
     priority: StrategyPriority
     state: StrategyState
-
-    @field_validator("priority", mode="before")
-    @classmethod
-    def _normalize_priority(cls, value):
-        if value is None:
-            return value
-        raw = str(value).strip().lower()
-        return _PRIORITY_ALIASES.get(raw, value)
-
-    @field_validator("state", mode="before")
-    @classmethod
-    def _normalize_state(cls, value):
-        if value is None:
-            return value
-        raw = str(value).strip().lower()
-        return _STATE_ALIASES.get(raw, value)
 
 
 class StrategyQueryPayload(BaseModel):
@@ -134,19 +73,3 @@ class StrategyQueryPayload(BaseModel):
     state: Optional[StrategyState] = None
     competitor_asin: Optional[AsinCode] = None
     yida_asin: Optional[AsinCode] = None
-
-    @field_validator("priority", mode="before")
-    @classmethod
-    def _normalize_priority(cls, value):
-        if value is None:
-            return value
-        raw = str(value).strip().lower()
-        return _PRIORITY_ALIASES.get(raw, value)
-
-    @field_validator("state", mode="before")
-    @classmethod
-    def _normalize_state(cls, value):
-        if value is None:
-            return value
-        raw = str(value).strip().lower()
-        return _STATE_ALIASES.get(raw, value)

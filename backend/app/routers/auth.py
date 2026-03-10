@@ -27,3 +27,20 @@ def dingtalk_refresh_user(
 ) -> Dict[str, Any]:
     user = auth_service.refresh_user(current_user.userid)
     return ok_response({"user": user})
+
+
+@router.get("/api/auth/me")
+def auth_me(
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Dict[str, Any]:
+    return ok_response(
+        {
+            "user": {
+                "dingtalk_userid": current_user.userid,
+                "dingtalk_username": current_user.username,
+                "role": current_user.role,
+                "product_scope": current_user.product_scope,
+                "roles": list(current_user.roles or []),
+            }
+        }
+    )

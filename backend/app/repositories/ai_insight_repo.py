@@ -13,7 +13,7 @@ def insert_job(
     operator_userid: str,
 ) -> None:
     sql = """
-        INSERT INTO fact_ai_insight (
+        INSERT INTO fact_bi_amzon_insight (
             job_id,
             asin,
             site,
@@ -29,7 +29,7 @@ def _set_job_status(job_id: str, status: str, report_text: Optional[str] = None)
     if report_text is None:
         execute(
             """
-            UPDATE fact_ai_insight
+            UPDATE fact_bi_amzon_insight
             SET status = %s
             WHERE job_id = %s
             """,
@@ -38,7 +38,7 @@ def _set_job_status(job_id: str, status: str, report_text: Optional[str] = None)
         return
     execute(
         """
-        UPDATE fact_ai_insight
+        UPDATE fact_bi_amzon_insight
         SET status = %s,
             report_text = %s
         WHERE job_id = %s
@@ -69,7 +69,7 @@ def fetch_job(job_id: str) -> Optional[Dict[str, Any]]:
             operator_userid,
             created_at,
             report_text
-        FROM fact_ai_insight
+        FROM fact_bi_amzon_insight
         WHERE job_id = %s
         LIMIT 1
     """
@@ -109,13 +109,26 @@ def fetch_jobs(
             j.operator_userid,
             j.created_at,
             j.report_text
-        FROM fact_ai_insight j
+        FROM fact_bi_amzon_insight j
         {where_clause}
         ORDER BY j.created_at DESC
         LIMIT %s OFFSET %s
     """
     params.extend([limit, offset])
     return fetch_all(sql, params)
+
+
+def delete_job(job_id: str, role: str, userid: str) -> int:
+    """Returns affected row count. Non-admin users can only delete their own jobs."""
+    if role == "admin":
+        sql = "DELETE FROM fact_bi_amzon_insight WHERE job_id = %s"
+        execute(sql, (job_id,))
+    else:
+        sql = "DELETE FROM fact_bi_amzon_insight WHERE job_id = %s AND operator_userid = %s"
+        execute(sql, (job_id, userid))
+    # check deletion by trying to fetch
+    row = fetch_one("SELECT 1 FROM fact_bi_amzon_insight WHERE job_id = %s LIMIT 1", (job_id,))
+    return 0 if row else 1
 
 
 def serialize_datetime(value: Any) -> Optional[str]:

@@ -79,7 +79,7 @@ def query_strategy_list(
 
 @router.get("/api/yida-strategy/{strategy_id}")
 def get_strategy_detail(
-    strategy_id: int,
+    strategy_id: str,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> Dict[str, Any]:
     item = strategy_service.get_strategy_detail(strategy_id, current_user.role, current_user.userid)
@@ -110,7 +110,7 @@ def create_strategy(
 
 @router.put("/api/yida-strategy/{strategy_id}/state")
 def update_strategy_state(
-    strategy_id: int,
+    strategy_id: str,
     payload: StrategyStatePayload,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -128,7 +128,7 @@ def update_strategy_state(
 
 @router.put("/api/yida-strategy/{strategy_id}")
 def update_strategy(
-    strategy_id: int,
+    strategy_id: str,
     payload: StrategyUpdatePayload,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -151,7 +151,7 @@ def update_strategy(
 
 @router.delete("/api/yida-strategy/{strategy_id}")
 def delete_strategy(
-    strategy_id: int,
+    strategy_id: str,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> Dict[str, Any]:
     strategy_service.delete_strategy(strategy_id, current_user.role, current_user.userid)

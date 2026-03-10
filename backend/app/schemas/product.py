@@ -9,15 +9,15 @@ from .bsr import BsrPayload
 
 SiteCode = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"(?i)^(US|CA|UK|DE)$"),
+    StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"(?i)^(US|CA|UK|DE|JP)$"),
 ]
 AsinCode = Annotated[
     str,
     StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"^[A-Za-z0-9]{10}$"),
 ]
-SkuText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
-ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
-MediumText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
+SkuText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=64)]
+ShortText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=128)]
+MediumText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=512)]
 
 
 class YidaProductsQueryPayload(BaseModel):
@@ -26,6 +26,7 @@ class YidaProductsQueryPayload(BaseModel):
     limit: int = Field(default=200, ge=1, le=2000)
     offset: int = Field(default=0, ge=0)
     site: Optional[SiteCode] = None
+    q: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=128)]] = None
 
 
 class YidaProductPayload(BaseModel):
@@ -36,14 +37,15 @@ class YidaProductPayload(BaseModel):
     sku: Optional[SkuText] = None
     brand: Optional[ShortText] = None
     product: Optional[MediumText] = None
+    category: Optional[ShortText] = None
     application_tags: Optional[MediumText] = None
-    tooth_pattern_tags: Optional[MediumText] = None
+    other_tags: Optional[MediumText] = None
     material_tags: Optional[MediumText] = None
-    spec_length: Optional[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]] = None
+    spec_length: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=64)]] = None
     spec_quantity: Optional[int] = Field(default=None, ge=0, le=1000000)
-    spec_other: Optional[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)]] = None
+    spec_other: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=256)]] = None
     position_tags: Optional[MediumText] = None
-    status: Optional[Literal["在售", "停售", "待上架", "下架"]] = "在售"
+    status: Optional[Literal["在售", "观察中", "停售", "待上架", "下架"]] = "在售"
     created_at: Optional[date] = None
     updated_at: Optional[date] = None
     bsr: Optional[BsrPayload] = None

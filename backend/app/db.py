@@ -50,11 +50,23 @@ def _get_engine() -> Engine:
             pool_timeout=_env_int("DB_POOL_TIMEOUT", 30),
             pool_recycle=_env_int("DB_POOL_RECYCLE", 1800),
             pool_pre_ping=True,
-            connect_args={
-                "cursorclass": pymysql.cursors.DictCursor,
-            },
         )
     return _ENGINE
+
+
+class _DictCursorConnection:
+    """Wrap a DBAPI connection so `cursor()` defaults to DictCursor for app queries."""
+
+    def __init__(self, raw_conn):
+        self._raw_conn = raw_conn
+
+    def cursor(self, *args, **kwargs):
+        if not args and not kwargs:
+            return self._raw_conn.cursor(pymysql.cursors.DictCursor)
+        return self._raw_conn.cursor(*args, **kwargs)
+
+    def __getattr__(self, item):
+        return getattr(self._raw_conn, item)
 
 
 def get_db_config() -> dict:
@@ -72,14 +84,15 @@ def get_db_config() -> dict:
 
 @contextmanager
 def get_connection():
-    conn = _get_engine().raw_connection()
+    raw_conn = _get_engine().raw_connection()
+    conn = _DictCursorConnection(raw_conn)
     try:
         yield conn
     except Exception:
-        conn.rollback()
+        raw_conn.rollback()
         raise
     finally:
-        conn.close()
+        raw_conn.close()
 
 
 QueryParams = Optional[Sequence[Any]]

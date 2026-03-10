@@ -15,6 +15,8 @@ from pydantic import BaseModel
 from .core.config import get_auth_secret_or_raise
 from .core.logging import get_request_id, logger
 from .db import execute, fetch_one
+from .repositories import rbac_repo
+from .services import rbac_service
 
 
 @dataclass
@@ -23,6 +25,7 @@ class CurrentUser:
     username: str
     role: str
     product_scope: str = "all"
+    roles: List[str] | None = None
 
 
 class DingTalkSignPayload(BaseModel):
@@ -48,6 +51,21 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _is_production_env() -> bool:
+    app_env = str(_env("APP_ENV", "") or _env("ENV", "") or "").strip().lower()
+    return app_env in {"prod", "production"}
+
+def _is_debug_actor_enabled() -> bool:
+    value = str(_env("DINGTALK_DEBUG_ACTOR_ENABLED", "false") or "false").strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+DEBUG_ACTORS: Dict[str, str] = {
+    "user_a": "debug_user_a",
+    "user_b": "debug_user_b",
+}
 
 
 def _get_auth_secret() -> str:
@@ -159,7 +177,7 @@ _TICKET_CACHE: Dict[str, Any] = {"ticket": None, "expires_at": 0}
 
 USER_SELECT_SQL = """
     SELECT dingtalk_userid, dingtalk_username, avatar_url, role, status, product_scope
-    FROM dim_user
+    FROM dim_bi_amazon_user
     WHERE dingtalk_userid = %s
     LIMIT 1
 """
@@ -443,7 +461,7 @@ def search_dingtalk_users(keyword: str, limit: int = 8) -> List[Dict[str, str]]:
 def _upsert_user(userid: str, username: str, avatar_url: Optional[str], default_role: str) -> Dict[str, Any]:
     execute(
         """
-        INSERT INTO dim_user (dingtalk_userid, dingtalk_username, avatar_url, role, status)
+        INSERT INTO dim_bi_amazon_user (dingtalk_userid, dingtalk_username, avatar_url, role, status)
         VALUES (%s, %s, %s, %s, 'active')
         ON DUPLICATE KEY UPDATE
             dingtalk_username = VALUES(dingtalk_username),
@@ -456,11 +474,19 @@ def _upsert_user(userid: str, username: str, avatar_url: Optional[str], default_
     row = fetch_one(USER_SELECT_SQL, (userid,))
     if not row:
         raise HTTPException(status_code=500, detail="User upsert failed")
+    role = str(row.get("role") or default_role or "operator").strip().lower() or "operator"
+    rbac_repo.replace_user_roles(userid, [role])
     return row
 
 
 def _fetch_user(userid: str) -> Optional[Dict[str, Any]]:
-    return fetch_one(USER_SELECT_SQL, (userid,))
+    row = fetch_one(USER_SELECT_SQL, (userid,))
+    if not row:
+        return None
+    roles = rbac_service.resolve_user_roles(userid, str(row.get("role") or "operator"))
+    row["role"] = rbac_service.pick_primary_role(roles)
+    row["roles"] = sorted(roles)
+    return row
 
 
 def refresh_user_profile(userid: str) -> Dict[str, Any]:
@@ -478,7 +504,7 @@ def refresh_user_profile(userid: str) -> Dict[str, Any]:
     if username or avatar_url:
         affected = execute(
             """
-            UPDATE dim_user
+            UPDATE dim_bi_amazon_user
             SET
                 dingtalk_username = COALESCE(%s, dingtalk_username),
                 avatar_url = COALESCE(%s, avatar_url),
@@ -538,16 +564,54 @@ def get_current_user(request: Request) -> CurrentUser:
     scope = (row.get("product_scope") or "all").strip().lower()
     if scope not in ("all", "restricted"):
         scope = "all"
+    roles = rbac_service.resolve_user_roles(userid, str(row.get("role") or "operator"))
+    primary_role = rbac_service.pick_primary_role(roles)
+
+    # Development-only identity simulation for permission testing.
+    debug_actor = str(request.headers.get("X-Debug-Actor", "") or "").strip().lower()
+    debug_userid = DEBUG_ACTORS.get(debug_actor)
+    if (
+        debug_userid
+        and _is_debug_actor_enabled()
+        and not _is_production_env()
+        and "admin" in roles
+    ):
+        debug_row = fetch_one(USER_SELECT_SQL, (debug_userid,))
+        if not debug_row or debug_row.get("status") == "disabled":
+            raise HTTPException(status_code=403, detail="Debug actor user unavailable")
+        debug_scope = (debug_row.get("product_scope") or "all").strip().lower()
+        if debug_scope not in ("all", "restricted"):
+            debug_scope = "all"
+        debug_roles = rbac_service.resolve_user_roles(debug_userid, str(debug_row.get("role") or "operator"))
+        debug_primary_role = rbac_service.pick_primary_role(debug_roles)
+        return CurrentUser(
+            userid=debug_row.get("dingtalk_userid") or debug_userid,
+            username=debug_row.get("dingtalk_username") or debug_userid,
+            role=debug_primary_role,
+            product_scope=debug_scope,
+            roles=sorted(debug_roles),
+        )
 
     return CurrentUser(
         userid=row.get("dingtalk_userid") or userid,
         username=row.get("dingtalk_username") or userid,
-        role=row.get("role") or "operator",
+        role=primary_role,
         product_scope=scope,
+        roles=sorted(roles),
     )
 
 
 def require_admin(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
-    if user.role != "admin":
+    user_roles = set(user.roles or [])
+    if user.role != "admin" and "admin" not in user_roles:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
+
+
+def require_admin_or_team_lead(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    user_roles = set(user.roles or [])
+    if user.role in {"admin", "team_lead"}:
+        return user
+    if "admin" in user_roles or "team_lead" in user_roles:
+        return user
+    raise HTTPException(status_code=403, detail="Admin or team_lead only")

@@ -1,11 +1,12 @@
 import {
   CalendarBlank,
+  CaretDown,
   CheckCircle,
   SidebarSimple,
   Star,
   CornersOut,
 } from "@phosphor-icons/react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AppDatePicker } from "../components/AppDatePicker";
 import { FormInput, FormSelect } from "../components/FormControls";
@@ -17,6 +18,8 @@ type Task = {
   title: string;
   asin: string;
   owner: string;
+  brand: string;
+  review_date: string | null;
   priority: string;
   status: Status;
 };
@@ -30,10 +33,13 @@ type StrategyDetail = {
   brand: string;
   owner: string;
   owner_userid: string;
+  participant_userids?: string[] | string | null;
   userid: string;
   priority: string;
   state: string;
   review_date: string | null;
+  deadline_time?: string | null;
+  reminder_time?: string | null;
   created_at: string | null;
 };
 
@@ -63,6 +69,15 @@ export function TodoBoard({
   const [detailSaving, setDetailSaving] = useState(false);
   const [detailDeleting, setDetailDeleting] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [selectedBrands, setSelectedBrands] = useState<string[]>([]);
+  const [selectedDates, setSelectedDates] = useState<string[]>([]);
+  const [selectedOwners, setSelectedOwners] = useState<string[]>([]);
+  const [openDropdown, setOpenDropdown] = useState<"brand" | "date" | "owner" | null>(null);
+  const dropdownRefs = useRef<Record<"brand" | "date" | "owner", HTMLDivElement | null>>({
+    brand: null,
+    date: null,
+    owner: null,
+  });
   const handleToggleCollapse = () => onToggleCollapse?.();
   const handleToggleFullscreen = () => {
     if (document.fullscreenElement) {
@@ -72,13 +87,49 @@ export function TodoBoard({
     document.documentElement.requestFullscreen?.();
   };
 
-  const totals = useMemo(() => {
-    const total = tasks.length;
-    const completed = tasks.filter((item) => item.status === "done").length;
-    const hold = tasks.filter((item) => item.status === "hold").length;
-    const doing = tasks.filter((item) => item.status === "doing").length;
-    return { total, completed, hold, doing };
+  const brandOptions = useMemo(() => {
+    const set = new Set<string>();
+    tasks.forEach((item) => {
+      const brand = String(item.brand || "").trim();
+      if (brand) set.add(brand);
+    });
+    return Array.from(set);
   }, [tasks]);
+
+  const dateOptions = useMemo(() => {
+    const set = new Set<string>();
+    tasks.forEach((item) => {
+      const reviewDate = String(item.review_date || "").trim();
+      if (reviewDate) set.add(reviewDate);
+    });
+    return Array.from(set).sort((a, b) => b.localeCompare(a));
+  }, [tasks]);
+
+  const ownerOptions = useMemo(() => {
+    const set = new Set<string>();
+    tasks.forEach((item) => {
+      const owner = String(item.owner || "").trim();
+      if (owner) set.add(owner);
+    });
+    return Array.from(set);
+  }, [tasks]);
+
+  const filteredTasks = useMemo(() => {
+    return tasks.filter((item) => {
+      const brandOk = selectedBrands.length === 0 || selectedBrands.includes(item.brand);
+      const dateOk = selectedDates.length === 0 || selectedDates.includes(String(item.review_date || ""));
+      const ownerOk = selectedOwners.length === 0 || selectedOwners.includes(item.owner);
+      return brandOk && dateOk && ownerOk;
+    });
+  }, [tasks, selectedBrands, selectedDates, selectedOwners]);
+
+  const totals = useMemo(() => {
+    const total = filteredTasks.length;
+    const completed = filteredTasks.filter((item) => item.status === "done").length;
+    const hold = filteredTasks.filter((item) => item.status === "hold").length;
+    const doing = filteredTasks.filter((item) => item.status === "doing").length;
+    return { total, completed, hold, doing };
+  }, [filteredTasks]);
 
   const todoStats = [
     { label: "Total Tasks", value: String(totals.total), sub: "All priorities", tone: "dark" },
@@ -92,9 +143,17 @@ export function TodoBoard({
       status,
       title: statusMeta[status].label,
       tone: statusMeta[status].tone,
-      items: tasks.filter((item) => item.status === status),
+      items: filteredTasks.filter((item) => item.status === status),
     }));
-  }, [tasks]);
+  }, [filteredTasks]);
+  const deadlineHourOptions = useMemo(
+    () => Array.from({ length: 24 }, (_, hour) => String(hour).padStart(2, "0")),
+    []
+  );
+  const deadlineMinuteOptions = useMemo(
+    () => Array.from({ length: 60 }, (_, minute) => String(minute).padStart(2, "0")),
+    []
+  );
 
   const mapStateToStatus = (state?: string): Status => {
     if (state === "进行中") return "doing";
@@ -137,7 +196,9 @@ export function TodoBoard({
         title: item.title || "未命名任务",
         asin: item.competitor_asin || item.yida_asin || "-",
         owner: item.owner || item.owner_userid || item.userid || "-",
-        priority: item.priority || "P2",
+        brand: item.brand || "",
+        review_date: item.review_date || null,
+        priority: item.priority || "普通",
         status: mapStateToStatus(item.state),
       }));
       setTasks(mapped);
@@ -161,6 +222,43 @@ export function TodoBoard({
       document.body.style.overflow = prev;
     };
   }, [detailOpen]);
+
+  useEffect(() => {
+    const onClickOutside = (event: MouseEvent) => {
+      if (!openDropdown) return;
+      const target = event.target as Node;
+      const container = dropdownRefs.current[openDropdown];
+      if (container && !container.contains(target)) {
+        setOpenDropdown(null);
+      }
+    };
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, [openDropdown]);
+
+  const toggleFilterValue = (
+    key: "brand" | "date" | "owner",
+    value: string
+  ) => {
+    const updater = (prev: string[]) => {
+      const next = new Set(prev);
+      if (next.has(value)) {
+        next.delete(value);
+      } else {
+        next.add(value);
+      }
+      return Array.from(next);
+    };
+    if (key === "brand") {
+      setSelectedBrands(updater);
+      return;
+    }
+    if (key === "date") {
+      setSelectedDates(updater);
+      return;
+    }
+    setSelectedOwners(updater);
+  };
 
   const openDetail = async (id: string) => {
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
@@ -193,10 +291,13 @@ export function TodoBoard({
         brand: item.brand || "",
         owner: item.owner || "",
         owner_userid: item.owner_userid || "",
+        participant_userids: item.participant_userids || [],
         userid: item.userid || "",
         priority: item.priority || "",
         state: item.state || "",
         review_date: item.review_date || null,
+        deadline_time: item.deadline_time || "18:00",
+        reminder_time: item.reminder_time || "无",
         created_at: item.created_at || null,
       });
       setDetailDraft({
@@ -208,10 +309,13 @@ export function TodoBoard({
         brand: item.brand || "",
         owner: item.owner || "",
         owner_userid: item.owner_userid || "",
+        participant_userids: item.participant_userids || [],
         userid: item.userid || "",
         priority: item.priority || "",
         state: item.state || "",
         review_date: item.review_date || null,
+        deadline_time: item.deadline_time || "18:00",
+        reminder_time: item.reminder_time || "无",
         created_at: item.created_at || null,
       });
     } catch (err) {
@@ -230,7 +334,7 @@ export function TodoBoard({
   const saveDetail = async () => {
     if (!detailDraft) return;
     if (!detailDraft.title || !detailDraft.detail) {
-      setDetailError("策略标题和详细方案说明不能为空。");
+      setDetailError("待办事项和描述不能为空。");
       return;
     }
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
@@ -246,7 +350,10 @@ export function TodoBoard({
           detail: detailDraft.detail,
           owner: detailDraft.owner,
           owner_userid: detailDraft.owner_userid,
+          participant_userids: detailDraft.participant_userids || [],
           review_date: detailDraft.review_date || null,
+          deadline_time: detailDraft.deadline_time || "18:00",
+          reminder_time: detailDraft.reminder_time || "无",
           priority: detailDraft.priority,
           state: detailDraft.state,
         }),
@@ -334,7 +441,7 @@ export function TodoBoard({
   };
 
   const handleAddTask = () => {
-    setNotice("请在 BSR 页面创建策略任务。");
+    setNotice("请在 Best Sellers 页面创建策略任务。");
   };
 
   return (
@@ -355,7 +462,121 @@ export function TodoBoard({
           <span className="text-gray-900 font-medium">ToDo</span>
         </div>
 
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-gray-400">Brand</span>
+            <div className="relative min-w-[148px]" ref={(el) => (dropdownRefs.current.brand = el)}>
+              <button
+                type="button"
+                onClick={() => setOpenDropdown((prev) => (prev === "brand" ? null : "brand"))}
+                className="w-full px-3 py-1.5 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] transition"
+              >
+                <span className="truncate">
+                  {selectedBrands.length === 0 ? "ALL" : `${selectedBrands.length} selected`}
+                </span>
+                <CaretDown
+                  size={12}
+                  className={`text-[#7A8596] transition-transform ${openDropdown === "brand" ? "rotate-180" : ""}`}
+                />
+              </button>
+              {openDropdown === "brand" && (
+                <div className="absolute left-0 top-full mt-2 z-30 min-w-full rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2 max-h-56 overflow-y-auto custom-scrollbar-thin">
+                  {brandOptions.map((brand) => (
+                    <label
+                      key={brand}
+                      className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-[#0C1731]"
+                        checked={selectedBrands.includes(brand)}
+                        onChange={() => toggleFilterValue("brand", brand)}
+                      />
+                      <span className={selectedBrands.includes(brand) ? "text-gray-900 font-bold" : "text-gray-600"}>
+                        {brand}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-gray-400">Date</span>
+            <div className="relative min-w-[148px]" ref={(el) => (dropdownRefs.current.date = el)}>
+              <button
+                type="button"
+                onClick={() => setOpenDropdown((prev) => (prev === "date" ? null : "date"))}
+                className="w-full px-3 py-1.5 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] transition"
+              >
+                <span className="truncate">
+                  {selectedDates.length === 0 ? "ALL" : `${selectedDates.length} selected`}
+                </span>
+                <CaretDown
+                  size={12}
+                  className={`text-[#7A8596] transition-transform ${openDropdown === "date" ? "rotate-180" : ""}`}
+                />
+              </button>
+              {openDropdown === "date" && (
+                <div className="absolute left-0 top-full mt-2 z-30 min-w-full rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2 max-h-56 overflow-y-auto custom-scrollbar-thin">
+                  {dateOptions.map((date) => (
+                    <label
+                      key={date}
+                      className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-[#0C1731]"
+                        checked={selectedDates.includes(date)}
+                        onChange={() => toggleFilterValue("date", date)}
+                      />
+                      <span className={selectedDates.includes(date) ? "text-gray-900 font-bold" : "text-gray-600"}>
+                        {date}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-gray-400">Owner</span>
+            <div className="relative min-w-[148px]" ref={(el) => (dropdownRefs.current.owner = el)}>
+              <button
+                type="button"
+                onClick={() => setOpenDropdown((prev) => (prev === "owner" ? null : "owner"))}
+                className="w-full px-3 py-1.5 rounded-xl bg-[#F4F6FA] border border-[#E9EDF3] text-[13px] text-[#3D4757] font-medium flex items-center justify-between hover:border-[#D5DBE6] transition"
+              >
+                <span className="truncate">
+                  {selectedOwners.length === 0 ? "ALL" : `${selectedOwners.length} selected`}
+                </span>
+                <CaretDown
+                  size={12}
+                  className={`text-[#7A8596] transition-transform ${openDropdown === "owner" ? "rotate-180" : ""}`}
+                />
+              </button>
+              {openDropdown === "owner" && (
+                <div className="absolute left-0 top-full mt-2 z-30 min-w-full rounded-xl border border-[#E6EBF2] bg-white shadow-lg p-2 max-h-56 overflow-y-auto custom-scrollbar-thin">
+                  {ownerOptions.map((owner) => (
+                    <label
+                      key={owner}
+                      className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D4757] hover:bg-[#F7F9FC] rounded cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-[#0C1731]"
+                        checked={selectedOwners.includes(owner)}
+                        onChange={() => toggleFilterValue("owner", owner)}
+                      />
+                      <span className={selectedOwners.includes(owner) ? "text-gray-900 font-bold" : "text-gray-600"}>
+                        {owner}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
           {loading && <span className="text-xs text-gray-400">加载中...</span>}
           {error && <span className="text-xs text-red-500">{error}</span>}
           {notice && !error && <span className="text-xs text-amber-600">{notice}</span>}
@@ -409,7 +630,7 @@ export function TodoBoard({
                   onClick={() => openDetail(item.id)}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-gray-500">{item.priority}</span>
+                    <span className="text-xs text-gray-500">{item.priority || "-"}</span>
                     <CheckCircle size={14} className="text-gray-400" />
                   </div>
                   <div className="mt-2">
@@ -503,7 +724,7 @@ export function TodoBoard({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4 backdrop-blur-[2px]">
           <div className="w-full max-w-2xl bg-white rounded-3xl shadow-xl p-6 max-h-[90vh] overflow-y-auto custom-scrollbar">
             <div className="flex items-center justify-between mb-6">
-              <h3 className="text-lg font-bold text-gray-900">策略详情</h3>
+              <h3 className="text-lg font-bold text-gray-900">待办详情</h3>
               <button
                 className="text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center rounded-full hover:bg-gray-50 transition-colors"
                 onClick={closeDetail}
@@ -523,47 +744,59 @@ export function TodoBoard({
             {!detailLoading && detailDraft && (
               <div className="space-y-5">
                 <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">策略标题</label>
-                  <FormInput
+                  <p className="text-xs text-gray-400 mb-2">创建于 {detailDraft.created_at || "-"}</p>
+                  <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">待办事项</label>
+                  <textarea
                     value={detailDraft.title}
                     onChange={(e) => handleDetailChange("title", e.target.value)}
+                    className="w-full min-h-[180px] bg-white p-4 rounded-2xl border border-gray-100 text-sm text-gray-600 whitespace-pre-wrap leading-relaxed shadow-sm font-medium focus:ring-4 focus:ring-blue-100 outline-none"
                   />
-                  <p className="text-xs text-gray-400 mt-1">
-                    创建于 {detailDraft.created_at || "-"}
-                  </p>
+                </div>
+                <div>
+                  <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">描述</label>
+                  <textarea
+                    value={detailDraft.detail}
+                    onChange={(e) => handleDetailChange("detail", e.target.value)}
+                    className="w-full min-h-[120px] bg-white p-4 rounded-2xl border border-gray-100 text-sm text-gray-600 whitespace-pre-wrap leading-relaxed shadow-sm font-medium focus:ring-4 focus:ring-blue-100 outline-none"
+                  />
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="md:col-span-2">
-                    <label className="block text-sm font-bold text-gray-700 mb-2">负责人</label>
-                    <FormInput value={detailDraft.owner || detailDraft.owner_userid || "-"} disabled />
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">负责人</label>
+                    <FormInput
+                      value={detailDraft.owner || detailDraft.owner_userid || "-"}
+                      disabled
+                      className="bg-white border-gray-100 text-[12px] font-bold text-gray-900 py-2"
+                    />
                   </div>
                   <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">竞品ASIN</label>
-                    <FormInput value={detailDraft.competitor_asin} disabled />
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">竞品ASIN</label>
+                    <FormInput value={detailDraft.competitor_asin} disabled className="bg-white border-gray-100 text-[12px] font-bold text-gray-900 py-2" />
                   </div>
                   <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">品牌</label>
-                    <FormInput value={detailDraft.brand || "-"} disabled />
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">品牌</label>
+                    <FormInput value={detailDraft.brand || "-"} disabled className="bg-white border-gray-100 text-[12px] font-bold text-gray-900 py-2" />
                   </div>
                   <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">优先级</label>
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">优先级</label>
                     <FormSelect
-                      value={detailDraft.priority || "中"}
+                      value={detailDraft.priority || "普通"}
                       onChange={(e) => handleDetailChange("priority", e.target.value)}
+                      className="bg-white border-gray-100 text-[12px] font-bold text-gray-900 py-2 focus:ring-4 focus:ring-blue-100"
                     >
-                      {["高", "中", "低"].map((opt) => (
-                        <option key={opt} value={opt}>
-                          {opt}
-                        </option>
-                      ))}
+                      <option value="较低">较低</option>
+                      <option value="普通">普通</option>
+                      <option value="较高">较高</option>
+                      <option value="紧急">紧急</option>
                     </FormSelect>
                   </div>
                   <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">执行状态</label>
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">状态</label>
                     <FormSelect
                       value={detailDraft.state || "待开始"}
                       onChange={(e) => handleDetailChange("state", e.target.value)}
+                      className="bg-white border-gray-100 text-[12px] font-bold text-gray-900 py-2 focus:ring-4 focus:ring-blue-100"
                     >
                       {["待开始", "进行中", "已完成", "搁置"].map((opt) => (
                         <option key={opt} value={opt}>
@@ -573,7 +806,7 @@ export function TodoBoard({
                     </FormSelect>
                   </div>
                   <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">计划复盘</label>
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">日期</label>
                     <AppDatePicker
                       value={detailDraft.review_date || ""}
                       onChange={(val) => handleDetailChange("review_date", val || "")}
@@ -581,15 +814,45 @@ export function TodoBoard({
                       className="bg-white border border-gray-100 text-[12px] font-bold text-gray-900"
                     />
                   </div>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-2">详细方案说明</label>
-                  <textarea
-                    value={detailDraft.detail}
-                    onChange={(e) => handleDetailChange("detail", e.target.value)}
-                    className="w-full min-h-[160px] bg-gray-50 p-4 rounded-2xl border border-gray-100 text-sm text-gray-600 whitespace-pre-wrap leading-relaxed shadow-sm font-medium focus:ring-4 focus:ring-blue-100 outline-none"
-                  />
+                  <div>
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">截止时间</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <FormSelect
+                        value={String(detailDraft.deadline_time || "18:00").split(":")[0] || "18"}
+                        onChange={(e) => {
+                          const hour = e.target.value;
+                          const minute = String(detailDraft.deadline_time || "18:00").split(":")[1] || "00";
+                          handleDetailChange("deadline_time", `${hour}:${minute}`);
+                        }}
+                        className="bg-white border-gray-100 text-[12px] font-bold text-gray-900 py-2 focus:ring-4 focus:ring-blue-100"
+                      >
+                        {deadlineHourOptions.map((opt) => (
+                          <option key={opt} value={opt}>
+                            {opt}
+                          </option>
+                        ))}
+                      </FormSelect>
+                      <FormSelect
+                        value={String(detailDraft.deadline_time || "18:00").split(":")[1] || "00"}
+                        onChange={(e) => {
+                          const minute = e.target.value;
+                          const hour = String(detailDraft.deadline_time || "18:00").split(":")[0] || "18";
+                          handleDetailChange("deadline_time", `${hour}:${minute}`);
+                        }}
+                        className="bg-white border-gray-100 text-[12px] font-bold text-gray-900 py-2 focus:ring-4 focus:ring-blue-100"
+                      >
+                        {deadlineMinuteOptions.map((opt) => (
+                          <option key={opt} value={opt}>
+                            {opt}
+                          </option>
+                        ))}
+                      </FormSelect>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest block mb-2">提醒时间</label>
+                    <FormInput value={detailDraft.reminder_time || "无"} disabled className="bg-gray-100 border-gray-100 text-[12px] font-semibold text-gray-700 py-2" />
+                  </div>
                 </div>
 
                 <div className="pt-2 flex gap-3">

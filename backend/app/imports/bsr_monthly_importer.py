@@ -128,7 +128,7 @@ def import_bsr_monthly(
 
     columns = ["site", "asin", "month", "sales_volume", "sales", "is_child", "price"]
     sql = """
-        INSERT INTO fact_bsr_monthly (site, asin, month, sales_volume, sales, is_child, price)
+        INSERT INTO fact_bi_amazon_product_month (site, asin, month, sales_volume, sales, is_child, price)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             sales_volume = VALUES(sales_volume),

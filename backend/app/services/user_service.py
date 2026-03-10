@@ -6,7 +6,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 from .. import auth as auth_core
-from ..repositories import user_repo
+from ..core.logging import logger
+from ..repositories import rbac_repo, user_repo
+from . import rbac_service
 
 
 def _normalize_allowed(value: Optional[str], allowed: set[str]) -> Optional[str]:
@@ -17,7 +19,7 @@ def _normalize_allowed(value: Optional[str], allowed: set[str]) -> Optional[str]
 
 
 def normalize_user_role(value: Optional[str]) -> Optional[str]:
-    return _normalize_allowed(value, {"admin", "operator"})
+    return _normalize_allowed(value, {"admin", "team_lead", "operator"})
 
 
 def normalize_user_status(value: Optional[str]) -> Optional[str]:
@@ -28,22 +30,37 @@ def normalize_product_scope(value: Optional[str]) -> Optional[str]:
     return _normalize_allowed(value, {"all", "restricted"})
 
 
-def normalize_asins(values: Optional[List[str]]) -> List[str]:
+def _parse_permission_token(raw: Any) -> Optional[tuple[str, str]]:
+    if raw is None:
+        return None
+    token = str(raw).strip()
+    if not token:
+        return None
+    parts: List[str]
+    for sep in ("|", "@@", "::"):
+        if sep in token:
+            parts = [part.strip() for part in token.split(sep, 1)]
+            asin = (parts[0] if parts else "").upper()
+            site = ((parts[1] if len(parts) > 1 else "") or "US").upper()
+            if not asin:
+                return None
+            return asin, site
+    return token.upper(), "US"
+
+
+def normalize_permission_pairs(values: Optional[List[str]]) -> List[tuple[str, str]]:
     if not values:
         return []
-    seen: set[str] = set()
-    items: List[str] = []
+    seen: set[tuple[str, str]] = set()
+    items: List[tuple[str, str]] = []
     for raw in values:
-        if raw is None:
+        pair = _parse_permission_token(raw)
+        if pair is None:
             continue
-        asin = str(raw).strip()
-        if not asin:
+        if pair in seen:
             continue
-        asin = asin.upper()
-        if asin in seen:
-            continue
-        seen.add(asin)
-        items.append(asin)
+        seen.add(pair)
+        items.append(pair)
     return items
 
 
@@ -70,6 +87,61 @@ def list_users(limit: int, offset: int, role: Optional[str], status: Optional[st
     return [_row_to_user_item(row) for row in rows]
 
 
+def _resolve_roles(userid: str, role: str) -> set[str]:
+    return rbac_service.resolve_user_roles(userid, role)
+
+
+def _is_admin(userid: str, role: str) -> bool:
+    roles = _resolve_roles(userid, role)
+    return "admin" in roles or role == "admin"
+
+
+def _is_team_lead(userid: str, role: str) -> bool:
+    roles = _resolve_roles(userid, role)
+    return "team_lead" in roles or role == "team_lead"
+
+
+def _team_member_userids_or_raise(userid: str, role: str) -> List[str]:
+    if _is_admin(userid, role):
+        return []
+    if not _is_team_lead(userid, role):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return rbac_repo.list_lead_team_member_userids(userid)
+
+
+def list_users_for_manager(
+    limit: int,
+    offset: int,
+    role: Optional[str],
+    status: Optional[str],
+    keyword: Optional[str],
+    operator_userid: str,
+    operator_role: str,
+) -> List[Dict[str, Any]]:
+    if _is_admin(operator_userid, operator_role):
+        return list_users(limit, offset, role, status, keyword)
+
+    visible_userids = _team_member_userids_or_raise(operator_userid, operator_role)
+    rows = user_repo.fetch_users(limit, offset, role, status, keyword, visible_userids=visible_userids)
+    return [_row_to_user_item(row) for row in rows]
+
+
+def assert_user_manageable(userid: str, operator_userid: str, operator_role: str) -> Dict[str, Any]:
+    target = user_repo.fetch_user_by_userid(userid)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if _is_admin(operator_userid, operator_role):
+        return target
+
+    member_userids = _team_member_userids_or_raise(operator_userid, operator_role)
+    if userid not in set(member_userids):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if str(target.get("role") or "").strip().lower() == "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return target
+
+
 def default_product_scope_for_role(role: str) -> str:
     return "restricted" if role == "operator" else "all"
 
@@ -83,15 +155,61 @@ def create_user(userid: str, username: str, avatar_url: Optional[str], role: str
         if "duplicate" in message or "unique" in message:
             raise HTTPException(status_code=409, detail="User already exists") from exc
         raise
+    if not rbac_repo.replace_user_roles(userid, [role]):
+        logger.warning("rbac_user_role_sync_failed userid=%s role=%s", userid, role)
     return product_scope
 
 
+def create_user_for_manager(
+    userid: str,
+    username: str,
+    avatar_url: Optional[str],
+    role: str,
+    status: str,
+    operator_userid: str,
+    operator_role: str,
+) -> str:
+    if _is_admin(operator_userid, operator_role):
+        return create_user(userid, username, avatar_url, role, status)
+
+    _team_member_userids_or_raise(operator_userid, operator_role)
+    if role == "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    member_userids = set(rbac_repo.list_lead_team_member_userids(operator_userid))
+    if userid not in member_userids:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return create_user(userid, username, avatar_url, role, status)
+
+
 def update_user(userid: str, role: Optional[str], status: Optional[str]) -> int:
-    return user_repo.update_user(userid, role, status)
+    affected = user_repo.update_user(userid, role, status)
+    if affected > 0 and role:
+        if not rbac_repo.replace_user_roles(userid, [role]):
+            logger.warning("rbac_user_role_sync_failed userid=%s role=%s", userid, role)
+    return affected
+
+
+def update_user_for_manager(
+    userid: str,
+    role: Optional[str],
+    status: Optional[str],
+    operator_userid: str,
+    operator_role: str,
+) -> int:
+    assert_user_manageable(userid, operator_userid, operator_role)
+    if not _is_admin(operator_userid, operator_role):
+        if role == "admin":
+            raise HTTPException(status_code=403, detail="Forbidden")
+    return update_user(userid, role, status)
 
 
 def remove_user(userid: str) -> int:
     return user_repo.delete_user(userid)
+
+
+def remove_user_for_manager(userid: str, operator_userid: str, operator_role: str) -> int:
+    assert_user_manageable(userid, operator_userid, operator_role)
+    return remove_user(userid)
 
 
 def list_audit_logs(
@@ -130,22 +248,43 @@ def lookup_dingtalk_users_by_name(name: str, limit: int = 8) -> List[Dict[str, A
     return auth_core.search_dingtalk_users(keyword, normalized_limit)
 
 
-def _require_operator_visibility_user(userid: str) -> Dict[str, Any]:
+def _require_visibility_user(userid: str) -> Dict[str, Any]:
     row = user_repo.fetch_user_product_visibility(userid)
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
-    if row.get("role") != "operator":
-        raise HTTPException(status_code=400, detail="Product visibility only supports operator users")
+    role = str(row.get("role") or "").strip().lower()
+    if role not in {"operator", "team_lead"}:
+        raise HTTPException(status_code=400, detail="Product visibility only supports operator/team_lead users")
     return row
 
 
 def get_user_product_visibility(userid: str) -> Dict[str, Any]:
-    row = _require_operator_visibility_user(userid)
+    row = _require_visibility_user(userid)
+    permissions_raw = row.get("permissions")
+    permissions = []
+    if isinstance(permissions_raw, list):
+        for item in permissions_raw:
+            asin = str((item or {}).get("asin") if isinstance(item, dict) else "").strip().upper()
+            site = str((item or {}).get("site") if isinstance(item, dict) else "US").strip().upper() or "US"
+            if not asin:
+                continue
+            permissions.append({"asin": asin, "site": site})
     return {
         "userid": row.get("dingtalk_userid") or userid,
         "product_scope": normalize_product_scope(row.get("product_scope")) or "all",
-        "asins": normalize_asins(row.get("asins")),
+        "permissions": permissions,
+        # Backward compatibility for old frontend payload/response handling.
+        "asins": [f"{entry['asin']}|{entry['site']}" for entry in permissions],
     }
+
+
+def get_user_product_visibility_for_manager(
+    userid: str,
+    operator_userid: str,
+    operator_role: str,
+) -> Dict[str, Any]:
+    assert_user_manageable(userid, operator_userid, operator_role)
+    return get_user_product_visibility(userid)
 
 
 def update_user_product_visibility(
@@ -159,26 +298,173 @@ def update_user_product_visibility(
     if not scope:
         raise HTTPException(status_code=400, detail="Invalid product_scope")
 
-    _require_operator_visibility_user(userid)
+    _require_visibility_user(userid)
 
-    normalized_asins = normalize_asins(asins)
+    normalized_pairs = normalize_permission_pairs(asins)
     if scope == "all":
-        normalized_asins = []
+        normalized_pairs = []
 
-    ok = user_repo.replace_user_product_visibility(userid, scope, normalized_asins, operator_userid)
+    ok = user_repo.replace_user_product_visibility(userid, scope, normalized_pairs, operator_userid)
     if not ok:
         raise HTTPException(status_code=404, detail="User not found")
 
+    normalized_tokens = [f"{asin}|{site}" for asin, site in normalized_pairs]
     log_audit(
         module="permission",
         action="update_product_visibility",
         target_id=userid,
         operator_userid=operator_userid,
         operator_name=operator_name,
-        detail=f"product_scope={scope}, asins={','.join(normalized_asins)}",
+        detail=f"product_scope={scope}, asins={','.join(normalized_tokens)}",
     )
 
-    return {"userid": userid, "product_scope": scope, "asins": normalized_asins, "count": len(normalized_asins)}
+    return {
+        "userid": userid,
+        "product_scope": scope,
+        "permissions": [{"asin": asin, "site": site} for asin, site in normalized_pairs],
+        "asins": normalized_tokens,
+        "count": len(normalized_pairs),
+    }
+
+
+def update_user_product_visibility_for_manager(
+    userid: str,
+    product_scope: str,
+    asins: List[str],
+    operator_userid: str,
+    operator_name: str,
+    operator_role: str,
+) -> Dict[str, Any]:
+    assert_user_manageable(userid, operator_userid, operator_role)
+    return update_user_product_visibility(userid, product_scope, asins, operator_userid, operator_name)
+
+
+def list_teams_for_manager(operator_userid: str, operator_role: str) -> List[Dict[str, Any]]:
+    if _is_admin(operator_userid, operator_role):
+        team_names: List[str] | None = None
+        rows = rbac_repo.fetch_team_members()
+    else:
+        team_names = rbac_repo.list_lead_team_names(operator_userid)
+        rows = rbac_repo.fetch_team_members(team_names)
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        team_name = str(row.get("team_name") or "").strip()
+        if not team_name:
+            continue
+        team_item = grouped.setdefault(
+            team_name,
+            {
+                "team_name": team_name,
+                "member_count": 0,
+                "members": [],
+            },
+        )
+        member = {
+            "userid": str(row.get("dingtalk_userid") or "").strip(),
+            "username": str(row.get("dingtalk_username") or "").strip(),
+            "member_role": str(row.get("member_role") or "").strip(),
+            "status": str(row.get("status") or "").strip(),
+        }
+        if not member["userid"]:
+            continue
+        team_item["members"].append(member)
+
+    result = list(grouped.values())
+    for item in result:
+        item["member_count"] = len(item["members"])
+    result.sort(key=lambda x: str(x.get("team_name") or ""))
+    return result
+
+
+def create_team(team_name: str, lead_userid: str, member_userids: List[str]) -> Dict[str, Any]:
+    normalized_team_name = str(team_name or "").strip()
+    normalized_lead_userid = str(lead_userid or "").strip()
+    if not normalized_team_name:
+        raise HTTPException(status_code=400, detail="Missing team_name")
+    if not normalized_lead_userid:
+        raise HTTPException(status_code=400, detail="Missing lead_userid")
+    if rbac_repo.team_exists(normalized_team_name):
+        raise HTTPException(status_code=409, detail="Team already exists")
+    if not rbac_repo.user_exists(normalized_lead_userid):
+        raise HTTPException(status_code=400, detail="Lead user not found")
+
+    normalized_members: List[str] = []
+    seen: set[str] = set()
+    for raw in member_userids or []:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        if not rbac_repo.user_exists(value):
+            continue
+        seen.add(value)
+        normalized_members.append(value)
+    if normalized_lead_userid not in seen:
+        normalized_members.insert(0, normalized_lead_userid)
+
+    rbac_repo.insert_team_members(normalized_team_name, normalized_lead_userid, normalized_members)
+    return {
+        "team_name": normalized_team_name,
+        "lead_userid": normalized_lead_userid,
+        "member_userids": normalized_members,
+    }
+
+
+def update_team(
+    team_name: str,
+    lead_userid: str,
+    member_userids: List[str],
+    new_team_name: str | None = None,
+) -> Dict[str, Any]:
+    normalized_team_name = str(team_name or "").strip()
+    normalized_new_team_name = str(new_team_name or normalized_team_name).strip()
+    normalized_lead_userid = str(lead_userid or "").strip()
+    if not normalized_team_name:
+        raise HTTPException(status_code=400, detail="Missing team_name")
+    if not normalized_new_team_name:
+        raise HTTPException(status_code=400, detail="Missing new_team_name")
+    if not normalized_lead_userid:
+        raise HTTPException(status_code=400, detail="Missing lead_userid")
+    if not rbac_repo.team_exists(normalized_team_name):
+        raise HTTPException(status_code=404, detail="Team not found")
+    if normalized_new_team_name != normalized_team_name and rbac_repo.team_exists(normalized_new_team_name):
+        raise HTTPException(status_code=409, detail="Team already exists")
+    if not rbac_repo.user_exists(normalized_lead_userid):
+        raise HTTPException(status_code=400, detail="Lead user not found")
+
+    normalized_members: List[str] = []
+    seen: set[str] = set()
+    for raw in member_userids or []:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        if not rbac_repo.user_exists(value):
+            continue
+        seen.add(value)
+        normalized_members.append(value)
+    if normalized_lead_userid not in seen:
+        normalized_members.insert(0, normalized_lead_userid)
+
+    rbac_repo.replace_team_members(
+        normalized_team_name,
+        normalized_lead_userid,
+        normalized_members,
+        normalized_new_team_name,
+    )
+    return {
+        "team_name": normalized_new_team_name,
+        "lead_userid": normalized_lead_userid,
+        "member_userids": normalized_members,
+    }
+
+
+def delete_team(team_name: str) -> int:
+    normalized_team_name = str(team_name or "").strip()
+    if not normalized_team_name:
+        raise HTTPException(status_code=400, detail="Missing team_name")
+    if not rbac_repo.team_exists(normalized_team_name):
+        raise HTTPException(status_code=404, detail="Team not found")
+    return rbac_repo.delete_team(normalized_team_name)
 
 
 def _to_int(value: Any) -> int:

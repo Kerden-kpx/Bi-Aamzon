@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 SiteCode = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"(?i)^(US|CA|UK|DE)$"),
+    StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"(?i)^(US|CA|UK|DE|JP)$"),
 ]
 AsinCode = Annotated[
     str,
@@ -31,13 +31,38 @@ class BsrQueryPayload(BaseModel):
     limit: int = Field(default=200, ge=1, le=2000)
     offset: int = Field(default=0, ge=0)
     createtime: Optional[date] = None
+    compare_date: Optional[date] = None
     site: Optional[SiteCode] = None
+    brand_filters: List[ShortText] = Field(default_factory=list, max_length=100)
+    rating_filters: List[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=16)]] = Field(default_factory=list, max_length=20)
+    tag_filters: List[TagText] = Field(default_factory=list, max_length=100)
+    category: Optional[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]] = None
+    price_min: Optional[float] = Field(default=None, ge=0, le=1000000)
+    price_max: Optional[float] = Field(default=None, ge=0, le=1000000)
+    compact: bool = False
+
+
+class BsrOverviewQueryPayload(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    createtime: Optional[date] = None
+    compare_date: Optional[date] = None
+    site: Optional[SiteCode] = None
+    category: Optional[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]] = None
 
 
 class BsrMonthlyPayload(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     asin: AsinCode
+    site: Optional[SiteCode] = "US"
+    is_child: Optional[int] = Field(default=None, ge=0, le=1)
+
+
+class BsrMonthlyBatchPayload(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    asins: List[AsinCode] = Field(default_factory=list, min_length=1, max_length=200)
     site: Optional[SiteCode] = "US"
     is_child: Optional[int] = Field(default=None, ge=0, le=1)
 
@@ -74,12 +99,6 @@ class BsrLookupPayload(BaseModel):
     brand: Optional[ShortText] = None
 
 
-class BsrFetchDailyPayload(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    site: Optional[SiteCode] = "US"
-
-
 class TagUpdatePayload(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -104,6 +123,7 @@ class BsrPayload(BaseModel):
     image_url: Optional[Annotated[str, StringConstraints(min_length=1, max_length=2048)]] = None
     product_url: Optional[Annotated[str, StringConstraints(min_length=1, max_length=2048)]] = None
     brand: Optional[Annotated[str, StringConstraints(min_length=1, max_length=128)]] = None
+    category: Optional[Annotated[str, StringConstraints(min_length=1, max_length=255)]] = None
     price: Optional[float] = Field(default=None, ge=0, le=1000000)
     list_price: Optional[float] = Field(default=None, ge=0, le=1000000)
     score: Optional[float] = Field(default=None, ge=0, le=5)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Re-import fact_bsr_daily data from exported xlsx files.
+"""Re-import fact_bi_amazon_product_day data from exported xlsx files.
 
 No CLI args. Configure constants below, then run:
   python backend/scripts/reimport_fact_bsr_daily.py

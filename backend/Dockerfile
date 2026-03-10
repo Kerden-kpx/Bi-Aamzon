@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app
 COPY scripts /app/scripts
-COPY files /app/files
+RUN mkdir -p /app/files /app/uploads
 
 EXPOSE 18765
 

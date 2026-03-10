@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from ..core.config import DEFAULT_BSR_SITE, normalize_site
 from ..repositories import bsr_repo, product_repo
 from ..schemas.product import YidaProductPayload
-from ..services import bsr_service
+from ..services import bsr_service, rbac_service
 
 
 def split_tags(value: Any) -> List[str]:
@@ -26,6 +26,7 @@ def bsr_has_payload(payload) -> bool:
         "image_url",
         "product_url",
         "brand",
+        "category",
         "price",
         "list_price",
         "score",
@@ -106,6 +107,7 @@ def build_bsr_payload(payload, fallback_brand: Optional[str], fallback_title: Op
         "image_url": payload.image_url,
         "product_url": payload.product_url,
         "brand": bsr_brand,
+        "category": payload.category,
         "price": payload.price,
         "list_price": payload.list_price,
         "score": payload.score,
@@ -128,15 +130,36 @@ def build_bsr_payload(payload, fallback_brand: Optional[str], fallback_title: Op
     }
 
 
-def list_products(site: str, limit: int, offset: int, role: str, userid: str, product_scope: str) -> List[Dict[str, Any]]:
-    site = normalize_site(site)
-    rows = product_repo.fetch_products(site, limit, offset, role, userid, product_scope)
+def list_products(
+    site: Optional[str],
+    limit: int,
+    offset: int,
+    role: str,
+    userid: str,
+    product_scope: str,
+    keyword: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    normalized_site = normalize_site(site) if str(site or "").strip() else None
+    normalized_keyword = str(keyword or "").strip() or None
+    roles = rbac_service.resolve_user_roles(userid, role)
+    scope = rbac_service.resolve_product_read_scope(userid, roles, product_scope)
+    effective_role = rbac_service.pick_primary_role(roles)
+    effective_scope = "all" if scope.allow_all else product_scope
+    rows = product_repo.fetch_products(
+        normalized_site,
+        limit,
+        offset,
+        effective_role,
+        userid,
+        effective_scope,
+        normalized_keyword,
+    )
     items = []
     for row in rows:
         tags = []
         tags.extend(split_tags(row.get("position_tags")))
         tags.extend(split_tags(row.get("application_tags")))
-        tags.extend(split_tags(row.get("tooth_pattern_tags")))
+        tags.extend(split_tags(row.get("other_tags")))
         tags.extend(split_tags(row.get("material_tags")))
 
         product_name = row.get("product") or ""
@@ -147,6 +170,7 @@ def list_products(site: str, limit: int, offset: int, role: str, userid: str, pr
                 "parent_asin": row.get("bsr_parent_asin") or "",
                 "site": row.get("bsr_site") or row.get("site") or DEFAULT_BSR_SITE,
                 "brand": row.get("bsr_brand") or "",
+                "category": row.get("bsr_category") or "",
                 "title": row.get("bsr_title") or "",
                 "image_url": row.get("bsr_image_url") or "",
                 "product_url": row.get("bsr_product_url") or "",
@@ -174,22 +198,24 @@ def list_products(site: str, limit: int, offset: int, role: str, userid: str, pr
                 "createtime": bsr_createtime.isoformat()
                 if isinstance(bsr_createtime, date)
                 else None,
+                "prev_bsr_rank": bsr_service.to_int(row.get("bsr_prev_rank")),
             }
 
         items.append(
             {
                 "asin": row.get("asin") or "",
-                "site": row.get("site") or site,
+                "site": row.get("site") or normalized_site or DEFAULT_BSR_SITE,
                 "sku": row.get("sku") or "",
                 "brand": row.get("brand") or "",
                 "product": product_name,
+                "category": row.get("category") or "",
                 "name": product_name,
                 "tags": tags,
                 "spec_length": row.get("spec_length") or "",
                 "spec_quantity": bsr_service.to_int(row.get("spec_quantity"), default=0),
                 "spec_other": row.get("spec_other") or "",
                 "application_tags": row.get("application_tags") or "",
-                "tooth_pattern_tags": row.get("tooth_pattern_tags") or "",
+                "other_tags": row.get("other_tags") or "",
                 "material_tags": row.get("material_tags") or "",
                 "position_tags": split_tags(row.get("position_tags")),
                 "position_tags_raw": row.get("position_tags") or "",
@@ -209,15 +235,25 @@ def list_products(site: str, limit: int, offset: int, role: str, userid: str, pr
 
 
 def create_product(payload: YidaProductPayload, creator_userid: str) -> None:
-    product_site = normalize_site(payload.site or (payload.bsr.site if payload.bsr else None))
+    raw_site = payload.site or (payload.bsr.site if payload.bsr else None)
+    if not str(raw_site or "").strip():
+        raise HTTPException(status_code=400, detail="Site is required")
+    if not str(payload.brand or "").strip():
+        raise HTTPException(status_code=400, detail="Brand is required")
+    if not str(payload.product or "").strip():
+        raise HTTPException(status_code=400, detail="Product name is required")
+
+    product_site = normalize_site(raw_site)
+    product_category = payload.category or (payload.bsr.category if payload.bsr else None)
     params = (
         payload.asin,
         product_site,
         payload.sku or "",
         payload.brand or "",
         payload.product or "",
+        product_category,
         payload.application_tags,
-        payload.tooth_pattern_tags,
+        payload.other_tags,
         payload.material_tags,
         payload.spec_length,
         payload.spec_quantity,
@@ -228,28 +264,36 @@ def create_product(payload: YidaProductPayload, creator_userid: str) -> None:
         payload.updated_at,
         creator_userid or None,
     )
-    if bsr_has_payload(payload.bsr):
-        bsr_site = normalize_site(payload.bsr.site if payload.bsr and payload.bsr.site else product_site)
-        bsr_data = build_bsr_payload(payload.bsr, payload.brand, payload.product)
-        product_repo.insert_product_with_bsr(
-            params,
-            bsr_data,
-            payload.asin,
-            bsr_data.get("createtime") or date.today(),
-            bsr_site,
-        )
-    else:
-        product_repo.insert_product(params)
+    try:
+        if bsr_has_payload(payload.bsr):
+            bsr_site = normalize_site(payload.bsr.site if payload.bsr and payload.bsr.site else product_site)
+            bsr_data = build_bsr_payload(payload.bsr, payload.brand, payload.product)
+            product_repo.insert_product_with_bsr(
+                params,
+                bsr_data,
+                payload.asin,
+                bsr_data.get("createtime") or date.today(),
+                bsr_site,
+            )
+        else:
+            product_repo.insert_product(params)
+    except Exception as exc:
+        message = str(exc).lower()
+        if "duplicate" in message or "unique" in message:
+            raise HTTPException(status_code=409, detail="Product already exists") from exc
+        raise
 
 
 def update_product(asin: str, site: str, payload: YidaProductPayload) -> int:
     normalized_site = normalize_site(site)
+    product_category = payload.category or (payload.bsr.category if payload.bsr else None)
     params = (
         payload.sku or "",
         payload.brand or "",
         payload.product or "",
+        product_category,
         payload.application_tags,
-        payload.tooth_pattern_tags,
+        payload.other_tags,
         payload.material_tags,
         payload.spec_length,
         payload.spec_quantity,
@@ -276,7 +320,10 @@ def update_product(asin: str, site: str, payload: YidaProductPayload) -> int:
 
 def delete_product(asin: str, site: str) -> int:
     normalized_site = normalize_site(site)
-    return product_repo.delete_product(asin, normalized_site)
+    affected = product_repo.delete_product(asin, normalized_site)
+    if affected > 0:
+        product_repo.delete_non_top100_bsr_items(asin, normalized_site)
+    return affected
 
 
 def ensure_product_exists(asin: str, site: str) -> None:
@@ -288,7 +335,11 @@ def ensure_product_exists(asin: str, site: str) -> None:
 def ensure_product_accessible(asin: str, site: str, role: str, userid: str, product_scope: str) -> None:
     normalized_site = normalize_site(site)
     ensure_product_exists(asin, normalized_site)
-    if role == "admin" or product_scope != "restricted":
+    roles = rbac_service.resolve_user_roles(userid, role)
+    scope = rbac_service.resolve_product_read_scope(userid, roles, product_scope)
+    if scope.allow_all:
+        return
+    if product_scope != "restricted":
         return
     if not product_repo.restricted_user_can_access_product(asin, normalized_site, userid):
         raise HTTPException(status_code=403, detail="Forbidden")
