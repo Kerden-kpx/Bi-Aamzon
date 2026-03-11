@@ -54,6 +54,12 @@ def parse_tags(value: Any) -> List[str]:
     return [tag.strip() for tag in str(value).split(",") if tag.strip()]
 
 
+def parse_promotion_tags(value: Any) -> List[str]:
+    if not value:
+        return []
+    return [tag.strip() for tag in str(value).split("|") if tag.strip()]
+
+
 def split_asins(value: Optional[str]) -> List[str]:
     if not value:
         return []
@@ -116,7 +122,9 @@ def bsr_row_to_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "ad_traffic_count": to_int(row.get("ad_traffic_count")),
         "organic_search_terms": to_int(row.get("organic_search_terms")),
         "ad_search_terms": to_int(row.get("ad_search_terms")),
+        "all_traffic_terms": to_int(row.get("all_traffic_terms")),
         "search_recommend_terms": to_int(row.get("search_recommend_terms")),
+        "promotion_tags": parse_promotion_tags(row.get("promotion_tags")),
         "launch_date": row.get("launch_date").isoformat()
         if isinstance(row.get("launch_date"), date)
         else None,

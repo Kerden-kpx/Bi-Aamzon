@@ -148,7 +148,7 @@ def get_bsr_dates(
 ) -> Dict[str, Any]:
     limit = max(1, min(payload.limit, 2000))
     offset = max(0, payload.offset)
-    items = bsr_service.list_bsr_dates(payload.site or "US", limit, offset)
+    items = bsr_service.list_bsr_dates(payload.site or "US", limit, offset, payload.category)
     return ok_response(list_response(items, limit, offset))
 
 

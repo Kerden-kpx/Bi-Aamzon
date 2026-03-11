@@ -16,6 +16,7 @@ class CategoryCreatePayload(BaseModel):
     level1: str = Field(..., min_length=1, max_length=64)
     level2: str = Field(..., min_length=1, max_length=64)
     level3: str = Field(..., min_length=1, max_length=64)
+    level4: str = Field(..., min_length=1, max_length=64)
     sort_order: int = Field(0, ge=0)
 
 
@@ -34,12 +35,13 @@ def create_category(
     level1 = payload.level1.strip()
     level2 = payload.level2.strip()
     level3 = payload.level3.strip()
-    if not level1 or not level2 or not level3:
-        raise HTTPException(status_code=400, detail="level1/level2/level3 不能为空")
-    if category_repo.category_exists(level1, level2, level3):
+    level4 = payload.level4.strip()
+    if not level1 or not level2 or not level3 or not level4:
+        raise HTTPException(status_code=400, detail="level1/level2/level3/level4 不能为空")
+    if category_repo.category_exists(level1, level2, level3, level4):
         raise HTTPException(status_code=409, detail="该类目已存在")
-    new_id = category_repo.create_category(level1, level2, level3, payload.sort_order)
-    return ok_response({"item": {"id": new_id, "level1": level1, "level2": level2, "level3": level3, "sort_order": payload.sort_order}})
+    new_id = category_repo.create_category(level1, level2, level3, level4, payload.sort_order)
+    return ok_response({"item": {"id": new_id, "level1": level1, "level2": level2, "level3": level3, "level4": level4, "sort_order": payload.sort_order}})
 
 
 @router.delete("/api/categories/{category_id}")

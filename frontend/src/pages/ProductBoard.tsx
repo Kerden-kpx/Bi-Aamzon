@@ -21,6 +21,7 @@ import {
   findCategoryPathByLeaf,
   getCategoryLeafFromPath,
 } from "../constants/productCategories";
+import { PRODUCT_BRAND_OPTIONS } from "../constants/ownBrandRules";
 import { PRODUCT_STATUS_COLOR } from "../constants/productStatus";
 import {
   formatMoney,
@@ -1142,10 +1143,11 @@ export function ProductBoard({
                           setBsrForm((prev) => ({ ...prev, brand }));
                         }}
                         className="pr-10 appearance-none"
-                      >
-                        <option value="EZARC">EZARC</option>
-                        <option value="TOLESA">TOLESA</option>
-                      </FormSelect>
+                        >
+                          {PRODUCT_BRAND_OPTIONS.map((brand) => (
+                            <option key={brand} value={brand}>{brand}</option>
+                          ))}
+                        </FormSelect>
                       <CaretDown
                         size={16}
                         className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-gray-400"

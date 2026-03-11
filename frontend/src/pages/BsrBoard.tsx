@@ -35,6 +35,7 @@ import {
   findCategoryPathByLeaf,
   getCategoryLeafFromPath,
 } from "../constants/productCategories";
+import { PRODUCT_BRAND_OPTIONS } from "../constants/ownBrandRules";
 import { PRODUCT_STATUS_COLOR } from "../constants/productStatus";
 import { mockConfig } from "../mock/data";
 import {
@@ -81,9 +82,11 @@ type BsrItem = {
   ad_traffic_count?: number | string | null;
   organic_search_terms?: number | string | null;
   ad_search_terms?: number | string | null;
+  all_traffic_terms?: number | string | null;
   search_recommend_terms?: number | string | null;
   sales_volume?: number | string | null;
   sales?: number | string | null;
+  promotion_tags?: string[] | null;
   is_limited_time_deal?: number | string | boolean | null;
   tags?: string[] | null;
   yida_asin?: string | null;
@@ -1009,28 +1012,15 @@ export function BsrBoard({
         const category = String(p.category || "").trim();
         if (!category) return false;
         const path = findCategoryPathByLeaf(category);
-        let level1 = "";
-        let level2 = "";
-        if (Array.isArray(path) && path.length >= 2) {
-          level1 = String(path[0] || "").trim();
-          level2 = String(path[1] || "").trim();
-        } else {
-          const parts = category
-            .replace(/＞/g, ">")
-            .split(/>|\/|\\/)
-            .map((item) => item.trim())
-            .filter(Boolean);
-          level1 = String(parts[0] || "").trim();
-          level2 = String(parts[1] || "").trim();
-        }
-        if (!level1) return false;
-        if (selectedSidebarCategoryPath.length === 1) {
-          return level1 === selectedSidebarCategoryPath[0];
-        }
-        return (
-          level1 === selectedSidebarCategoryPath[0] &&
-          level2 === selectedSidebarCategoryPath[1]
-        );
+        const normalizedPath = Array.isArray(path) && path.length > 0
+          ? path.map((item) => String(item || "").trim()).filter(Boolean)
+          : category
+              .replace(/＞/g, ">")
+              .split(/>|\/|\\/)
+              .map((item) => item.trim())
+              .filter(Boolean);
+        if (normalizedPath.length === 0) return false;
+        return selectedSidebarCategoryPath.every((selected, index) => normalizedPath[index] === selected);
       })();
 
       return matchesBrand && matchesTag && matchesCategory;
@@ -1239,16 +1229,68 @@ export function BsrBoard({
   }, []);
 
   useEffect(() => {
+    if (!mappingModalOpen || !mappingLeft?.asin) {
+      return;
+    }
+    const hasDetailMetrics =
+      mappingLeft.conversion_rate !== undefined && mappingLeft.conversion_rate !== null &&
+      mappingLeft.organic_traffic_count !== undefined && mappingLeft.organic_traffic_count !== null &&
+      mappingLeft.ad_traffic_count !== undefined && mappingLeft.ad_traffic_count !== null &&
+      mappingLeft.all_traffic_terms !== undefined && mappingLeft.all_traffic_terms !== null;
+    if (hasDetailMetrics) {
+      return;
+    }
+
+    let cancelled = false;
+    void requestBsrDetail({
+      asin: mappingLeft.asin,
+      site: mappingLeft.site || siteFilter,
+      createtime: mappingLeft.createtime,
+      brand: mappingLeft.brand,
+    }).then((detail) => {
+      if (cancelled || !detail) {
+        return;
+      }
+      setMappingLeft((prev) => {
+        if (!prev || String(prev.asin || "").trim().toUpperCase() !== String(detail.asin || "").trim().toUpperCase()) {
+          return prev;
+        }
+        return { ...prev, ...detail };
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    mappingLeft?.ad_traffic_count,
+    mappingLeft?.all_traffic_terms,
+    mappingLeft?.asin,
+    mappingLeft?.brand,
+    mappingLeft?.conversion_rate,
+    mappingLeft?.createtime,
+    mappingLeft?.organic_traffic_count,
+    mappingLeft?.site,
+    mappingModalOpen,
+    requestBsrDetail,
+    siteFilter,
+  ]);
+
+  useEffect(() => {
     const controller = new AbortController();
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
     setDateLoading(true);
     setDateLoaded(false);
     setDateError(null);
     logApi("load dates", `${apiBase}/api/bsr/dates`, { site: siteFilter });
+    const payload: Record<string, unknown> = { site: siteFilter };
+    if (categoryFilter) {
+      payload.category = categoryFilter;
+    }
     fetch(`${apiBase}/api/bsr/dates`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ site: siteFilter }),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     })
       .then((res) => {
@@ -1261,7 +1303,7 @@ export function BsrBoard({
       .then((data) => {
         const items = Array.isArray(data.items) ? data.items : [];
         setDateOptions(items);
-        setDateFilter(items[0] || "");
+        setDateFilter((prev) => (prev && items.includes(prev) ? prev : items[0] || ""));
       })
       .catch((err) => {
         if (err.name !== "AbortError") {
@@ -1275,14 +1317,19 @@ export function BsrBoard({
       });
 
     return () => controller.abort();
-  }, [siteFilter]);
+  }, [siteFilter, categoryFilter]);
 
   useEffect(() => {
     if (!dateFilter || dateOptions.length === 0) {
       setCompareDate("");
       return;
     }
-    setCompareDate(resolveDefaultCompareDate(dateFilter, dateOptions));
+    setCompareDate((prev) => {
+      if (prev && prev !== dateFilter && dateOptions.includes(prev)) {
+        return prev;
+      }
+      return resolveDefaultCompareDate(dateFilter, dateOptions);
+    });
   }, [dateFilter, dateOptions]);
 
   const openTagModal = (item: BsrItem) => {
@@ -1489,7 +1536,6 @@ export function BsrBoard({
       image_url: productBsrForm.image_url?.trim() || null,
       product_url: productBsrForm.product_url?.trim() || null,
       brand: productFormData.brand?.trim() || null,
-      category: productFormData.category?.trim() || null,
       createtime: productBsrForm.createtime?.trim() || null,
       price: toNumberOrNull(productBsrForm.price),
       list_price: toNumberOrNull(productBsrForm.list_price),
@@ -1590,10 +1636,14 @@ export function BsrBoard({
     setDateLoading(true);
     setDateError(null);
     try {
+      const payload: Record<string, unknown> = { site: siteFilter };
+      if (categoryFilter) {
+        payload.category = categoryFilter;
+      }
       const res = await fetch(`${apiBase}/api/bsr/dates`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ site: siteFilter }),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
@@ -1601,7 +1651,7 @@ export function BsrBoard({
       const data = await res.json();
       const items = Array.isArray(data.items) ? data.items : [];
       setDateOptions(items);
-      const nextDate = items[0] || "";
+      const nextDate = (dateFilter && items.includes(dateFilter) ? dateFilter : items[0]) || "";
       setDateFilter(nextDate);
       return { items, nextDate };
     } catch (err) {
@@ -2902,9 +2952,9 @@ export function BsrBoard({
     return Number.isNaN(date.getTime()) ? null : date;
   };
 
-  const formatValue = (type: string, value: unknown) => {
+  const formatValue = (type: string, value: unknown, currencySite?: string) => {
     if (value === null || value === undefined) return "-";
-    if (type === "currency") return `${getCurrencySymbol(compareLeft?.site || compareRight?.site || siteFilter)}${Number(value).toFixed(2)}`;
+    if (type === "currency") return `${getCurrencySymbol(currencySite || siteFilter)}${Number(value).toFixed(2)}`;
     if (type === "percent") return `${(Number(value) * 100).toFixed(2)}%`;
     if (type === "rank") return `#${Number(value).toLocaleString()}`;
     if (type === "int") return Number(value).toLocaleString();
@@ -2913,6 +2963,7 @@ export function BsrBoard({
   };
 
   const buildMetricRows = (left: Partial<BsrItem> | null | undefined, right: Partial<BsrItem> | null | undefined) => {
+    const currencySite = String(left?.site || right?.site || siteFilter || "US").trim().toUpperCase() || "US";
     const rows = [
       { key: "price", label: "价格", type: "currency", better: "lower", left: parseMoney(left?.price), right: parseMoney(right?.price) },
       { key: "bsr_rank", label: "BSR排名(类目)", type: "rank", better: "lower", left: parseNumber(left?.bsr_rank), right: parseNumber(right?.bsr_rank) },
@@ -2949,7 +3000,7 @@ export function BsrBoard({
         if (row.type === "percent") {
           diffText = `${diff >= 0 ? "+" : ""}${(diff * 100).toFixed(2)}%`;
         } else if (row.type === "currency") {
-          diffText = `${diff >= 0 ? "+" : ""}$${Math.abs(diff).toFixed(2)}`;
+          diffText = `${diff >= 0 ? "+" : ""}${getCurrencySymbol(currencySite)}${Math.abs(diff).toFixed(2)}`;
         } else {
           diffText = `${diff >= 0 ? "+" : ""}${diff.toFixed(2).replace(/\.00$/, "")}`;
         }
@@ -2961,8 +3012,16 @@ export function BsrBoard({
       }
       return {
         ...row,
-        leftDisplay: formatValue(row.type, row.left),
-        rightDisplay: formatValue(row.type, row.right),
+        leftDisplay: formatValue(row.type, row.left, currencySite),
+        rightDisplay: formatValue(row.type, row.right, currencySite),
+        leftNode:
+          row.key === "conversion_rate" ? (
+            <ConversionRateBadge value={left?.conversion_rate} period={left?.conversion_rate_period} />
+          ) : null,
+        rightNode:
+          row.key === "conversion_rate" ? (
+            <ConversionRateBadge value={right?.conversion_rate} period={right?.conversion_rate_period} />
+          ) : null,
         diffText,
         diffClass,
       };
@@ -2970,23 +3029,13 @@ export function BsrBoard({
   };
 
   const openMappingCompare = async (item: BsrItem, yidaAsin: string, meta?: ProductLibraryItem) => {
-    const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-    let rightItem = items.find((row) => row.asin === yidaAsin) || null;
+    let rightItem = await requestBsrDetail({
+      asin: yidaAsin,
+      site: item?.site || siteFilter,
+      createtime: item?.createtime || dateFilter,
+    });
     if (!rightItem) {
-      const lookupPayload: Record<string, unknown> = { asin: yidaAsin };
-      if (item?.createtime || dateFilter) {
-        lookupPayload.createtime = item?.createtime || dateFilter;
-      }
-      lookupPayload.site = item?.site || siteFilter;
-      const lookup = await fetch(`${apiBase}/api/bsr/lookup`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(lookupPayload),
-      });
-      if (lookup.ok) {
-        const data = await lookup.json();
-        rightItem = data.item || null;
-      }
+      rightItem = items.find((row) => row.asin === yidaAsin) || null;
     }
 
     const rightMeta =
@@ -3196,20 +3245,14 @@ export function BsrBoard({
     const nextBrand = String(selected?.brand || "").trim() || "全部";
     setCompareBrandFilter(nextBrand);
     setCompareTargetAsin(asin);
-    setMappingLoading(true);
     setMappingError(null);
-    try {
-      const meta = libraryItems.find((p) => p.asin === asin) || {
+    setMappingRight(null);
+    setMappingRightMeta(
+      libraryItems.find((p) => String(p?.asin || "").trim().toUpperCase() === String(asin || "").trim().toUpperCase()) || {
         asin,
         product: "-",
-      };
-      await openMappingCompare(mappingLeft, asin, meta);
-    } catch (err) {
-      setMappingError("获取对比数据失败，请检查后端服务。");
-      showToast("获取对比数据失败，请检查后端服务。", "error");
-    } finally {
-      setMappingLoading(false);
-    }
+      }
+    );
   };
 
   const handleToggleMapping = async () => {
@@ -3287,8 +3330,10 @@ export function BsrBoard({
     );
   };
 
-  const leftCompareItem = mappingLeft;
-  const rightCompareItem = mappingRight;
+  const leftCompareCacheKey = mappingLeft ? buildBsrDetailCacheKey(mappingLeft) : "";
+  const rightCompareCacheKey = mappingRight ? buildBsrDetailCacheKey(mappingRight) : "";
+  const leftCompareItem = (leftCompareCacheKey ? bsrDetailMap[leftCompareCacheKey] : null) || mappingLeft;
+  const rightCompareItem = (rightCompareCacheKey ? bsrDetailMap[rightCompareCacheKey] : null) || mappingRight;
 
   // Click outside to close dropdowns
   useEffect(() => {
@@ -3323,6 +3368,8 @@ export function BsrBoard({
 
   const compareOptions = useMemo(() => {
     const optionsMap = new Map<string, { asin: string; name: string; brand: string; self: boolean; competitor: boolean }>();
+    const targetSite = String(mappingLeft?.site || siteFilter || "US").trim().toUpperCase() || "US";
+    const targetCategory = String(mappingLeft?.category || "").trim();
 
     const pushOption = (
       asinRaw: unknown,
@@ -3355,15 +3402,25 @@ export function BsrBoard({
     };
 
     items.forEach((item) => {
+      const itemSite = String(item?.site || siteFilter || "US").trim().toUpperCase() || "US";
+      const itemCategory = String(item?.category || "").trim();
+      if (itemSite !== targetSite || itemCategory !== targetCategory) {
+        return;
+      }
       pushOption(item?.asin, item?.title, item?.brand, "competitor");
     });
 
     libraryItems.forEach((item) => {
+      const itemSite = String(item?.site || targetSite).trim().toUpperCase() || targetSite;
+      const itemCategory = String(item?.category || item?.bsr?.category || "").trim();
+      if (itemSite !== targetSite || itemCategory !== targetCategory) {
+        return;
+      }
       pushOption(item?.asin, item?.product || item?.name, item?.brand, "self");
     });
 
     return Array.from(optionsMap.values());
-  }, [items, libraryItems]);
+  }, [items, libraryItems, mappingLeft?.category, mappingLeft?.site, siteFilter]);
 
   const compareTypeOptions: Array<"自家" | "竞品"> = ["自家", "竞品"];
 
@@ -3434,6 +3491,47 @@ export function BsrBoard({
     setMappingRightMeta(null);
   }, [filteredCompareOptions, selectedCompareAsinUpper]);
 
+  useEffect(() => {
+    if (!mappingModalOpen || !mappingLeft || !selectedCompareAsin) {
+      return;
+    }
+    if (String(mappingRight?.asin || "").trim().toUpperCase() === selectedCompareAsinUpper) {
+      return;
+    }
+
+    let cancelled = false;
+    const meta =
+      libraryItems.find((p) => String(p?.asin || "").trim().toUpperCase() === selectedCompareAsinUpper) || {
+        asin: selectedCompareAsin,
+        product: "-",
+      };
+
+    setMappingLoading(true);
+    setMappingError(null);
+    void openMappingCompare(mappingLeft, selectedCompareAsin, meta)
+      .catch(() => {
+        if (!cancelled) {
+          setMappingError("获取对比数据失败，请检查后端服务。");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setMappingLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    libraryItems,
+    mappingLeft,
+    mappingModalOpen,
+    mappingRight?.asin,
+    selectedCompareAsin,
+    selectedCompareAsinUpper,
+  ]);
+
   const selectedInLibrary = useMemo(
     () => libraryItems.some((item) => String(item?.asin || "").trim().toUpperCase() === selectedCompareAsinUpper),
     [libraryItems, selectedCompareAsinUpper]
@@ -3483,22 +3581,12 @@ export function BsrBoard({
   }, [categoryFilter, categoryOptions]);
 
   useEffect(() => {
-    if (!dateLoaded) {
-      setCategoryOptions([]);
-      return;
-    }
-
     const controller = new AbortController();
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-    const payload: Record<string, unknown> = { site: siteFilter };
-    if (dateFilter) {
-      payload.createtime = dateFilter;
-    }
-
     fetch(`${apiBase}/api/bsr/overview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ site: siteFilter }),
       signal: controller.signal,
     })
       .then((res) => {
@@ -3522,7 +3610,7 @@ export function BsrBoard({
       });
 
     return () => controller.abort();
-  }, [dateFilter, dateLoaded, siteFilter]);
+  }, [siteFilter]);
 
   useEffect(() => {
     if (libraryLoadEnabled) {
@@ -4501,8 +4589,9 @@ export function BsrBoard({
                           }}
                           className="pr-10 appearance-none"
                         >
-                          <option value="EZARC">EZARC</option>
-                          <option value="TOLESA">TOLESA</option>
+                          {PRODUCT_BRAND_OPTIONS.map((brand) => (
+                            <option key={brand} value={brand}>{brand}</option>
+                          ))}
                         </FormSelect>
                         <CaretDown
                           size={16}
@@ -5060,7 +5149,7 @@ export function BsrBoard({
                           <div className="text-xs text-gray-400 mb-2">对比产品</div>
                           <div className="min-h-[54px]">
                             <div className="text-sm font-bold text-gray-900 line-clamp-2">
-                              {mappingRightMeta?.product || mappingRightMeta?.name || "-"}
+                              {mappingRight?.title || "-"}
                             </div>
                             <div className="text-xs text-gray-500 mt-1 font-mono">
                               ASIN: {mappingRightMeta?.asin || "-"}
@@ -5078,7 +5167,7 @@ export function BsrBoard({
                           >
                             <div className="flex justify-between items-center h-7 text-xs text-gray-600 bg-slate-50/50 rounded-xl px-4">
                               <span className="whitespace-nowrap">{row.label}</span>
-                              <span className="font-bold text-gray-900 whitespace-nowrap">{row.leftDisplay}</span>
+                              <span className="font-bold text-gray-900 whitespace-nowrap">{row.leftNode || row.leftDisplay}</span>
                             </div>
 
                             <div className={`h-7 flex items-center justify-center font-bold text-xs ${row.diffClass}`}>
@@ -5096,7 +5185,7 @@ export function BsrBoard({
                             </div>
 
                             <div className="flex justify-between items-center h-7 text-xs text-gray-600 bg-slate-50/50 rounded-xl px-4">
-                              <span className="font-bold text-gray-900 whitespace-nowrap">{row.rightDisplay}</span>
+                              <span className="font-bold text-gray-900 whitespace-nowrap">{row.rightNode || row.rightDisplay}</span>
                               <span className="whitespace-nowrap text-right">{row.label}</span>
                             </div>
                           </div>
@@ -5954,6 +6043,7 @@ const LibraryProductCard = memo(function LibraryProductCard({
   onHoverHide,
 }: LibraryProductCardProps) {
   const [imageError, setImageError] = useState(false);
+  const cardRef = useRef<HTMLDivElement | null>(null);
   const bsr = useMemo(() => {
     if (product?.bsr && typeof product.bsr === "object") {
       return product.bsr as Partial<BsrItem>;
@@ -5977,6 +6067,7 @@ const LibraryProductCard = memo(function LibraryProductCard({
     const organicTerms = toCountValue(bsr?.organic_search_terms);
     const adTerms = toCountValue(bsr?.ad_search_terms);
     const recommendTerms = toCountValue(bsr?.search_recommend_terms);
+    const totalTerms = toCountValue(bsr?.all_traffic_terms);
     const rawSpecQuantity = product?.spec_quantity;
     const specQuantityText =
       rawSpecQuantity === null || rawSpecQuantity === undefined || rawSpecQuantity === ""
@@ -5991,7 +6082,7 @@ const LibraryProductCard = memo(function LibraryProductCard({
       adText: formatNumberValue(bsr?.ad_traffic_count),
       organicShareText: formatTrafficShareValue(bsr?.organic_traffic_count, bsr?.ad_traffic_count, "organic"),
       adShareText: formatTrafficShareValue(bsr?.organic_traffic_count, bsr?.ad_traffic_count, "ad"),
-      totalTerms: organicTerms + adTerms + recommendTerms,
+      totalTerms,
       organicTerms,
       adTerms,
       recommendTerms,
@@ -6056,8 +6147,35 @@ const LibraryProductCard = memo(function LibraryProductCard({
     onRequestMonthlySalesTrend({ asin: product.asin, site: displaySite });
   };
 
+  useEffect(() => {
+    if (monthlySalesTrend && monthlySalesTrend.length > 0) return;
+    if (!product?.asin) return;
+    const node = cardRef.current;
+    if (!node) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const isVisible = entries.some((entry) => entry.isIntersecting);
+        if (!isVisible) return;
+        handleSparklineRequest();
+        observer.disconnect();
+      },
+      {
+        root: null,
+        rootMargin: "240px 0px",
+        threshold: 0.15,
+      },
+    );
+
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [displaySite, monthlySalesTrend, product?.asin]);
+
   return (
     <div
+      ref={cardRef}
       className={`rounded-3xl border p-4 bg-[#F8FAFC] transition ${selected ? "border-[#3B9DF8] ring-2 ring-[#3B9DF8]/20" : "border-gray-100 hover:border-gray-200"}`}
       onMouseEnter={(e) => handleHoverShow(e.currentTarget)}
       onMouseLeave={() => onHoverHide(product.asin)}
@@ -6584,7 +6702,7 @@ function ProductCard({
   const organicTerms = toCountValue(detail?.organic_search_terms);
   const adTerms = toCountValue(detail?.ad_search_terms);
   const recommendTerms = toCountValue(detail?.search_recommend_terms);
-  const totalTerms = organicTerms + adTerms + recommendTerms;
+  const totalTerms = toCountValue(detail?.all_traffic_terms);
   const trafficShareText = formatTrafficShareValue(detail?.organic_traffic_count, detail?.ad_traffic_count, "organic");
   const adTrafficShareText = formatTrafficShareValue(detail?.organic_traffic_count, detail?.ad_traffic_count, "ad");
 
@@ -6605,13 +6723,9 @@ function ProductCard({
     return diffMs <= 180 * 24 * 60 * 60 * 1000;
   })();
 
-  const isLimitedTimeDeal = (() => {
-    const raw = item?.is_limited_time_deal;
-    if (typeof raw === "boolean") return raw;
-    if (raw === null || raw === undefined) return false;
-    const normalized = String(raw).trim().toLowerCase();
-    return normalized === "1" || normalized === "true" || normalized === "yes";
-  })();
+  const promotionTags = Array.isArray(item?.promotion_tags)
+    ? item.promotion_tags.map((tag) => String(tag || "").trim()).filter(Boolean)
+    : [];
 
   const priceDiffPercent = (() => {
     const current = Number(String(item?.price ?? "").replace(/[^0-9.-]/g, ""));
@@ -6926,11 +7040,18 @@ function ProductCard({
               反查关键词
             </a>
           </div>
-          {isLimitedTimeDeal && (
+          {promotionTags.length > 0 && (
             <div className="mt-1">
-              <span className="inline-flex w-fit items-center px-2.5 py-1 rounded-md text-[12px] leading-none font-semibold text-white bg-[#D80B4A]">
-                Limited time deal
-              </span>
+              <div className="flex flex-wrap gap-1.5">
+                {promotionTags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="inline-flex w-fit items-center px-2.5 py-1 rounded-md text-[12px] leading-none font-semibold text-white bg-[#D80B4A]"
+                  >
+                    {tag}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
         </div>

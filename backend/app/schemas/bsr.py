@@ -88,6 +88,7 @@ class BsrDatesPayload(BaseModel):
     limit: int = Field(default=200, ge=1, le=2000)
     offset: int = Field(default=0, ge=0)
     site: Optional[SiteCode] = "US"
+    category: Optional[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]] = None
 
 
 class BsrLookupPayload(BaseModel):

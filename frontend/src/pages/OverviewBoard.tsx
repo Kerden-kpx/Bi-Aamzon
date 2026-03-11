@@ -9,6 +9,7 @@ import { LegendComponent, TooltipComponent } from "echarts/components";
 import * as echarts from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { getOwnBrandsForCategory } from "../constants/ownBrandRules";
 import { formatSalesMoney, getCurrencySymbol } from "../utils/valueFormat";
 
 echarts.use([PieChart, TooltipComponent, LegendComponent, CanvasRenderer]);
@@ -67,6 +68,7 @@ const DONUT_CORE_COLORS: Record<string, string> = {
     Diablo: "#1D39C4",
     EZARC: "#3B9DF8",
     TOLESA: "#111827",
+    YPLUS: "#D97706",
 };
 
 const DONUT_PRESET_COLORS = [
@@ -89,7 +91,6 @@ const DONUT_PRESET_COLORS = [
 ];
 
 const DONUT_OTHER_COLOR = "#BFBFBF";
-const OWN_BRANDS = ["EZARC", "TOLESA"] as const;
 const OVERVIEW_SITE_OPTIONS = ["US", "CA", "UK", "DE", "JP"] as const;
 const aggregateStats = (
     stats: BrandStat[],
@@ -286,6 +287,7 @@ export function OverviewBoard({
     const ownSales = overviewSummary.ownSales;
     const ownSalesVolume = overviewSummary.ownSalesVolume;
     const currencySymbol = getCurrencySymbol(siteFilter);
+    const activeOwnBrands = getOwnBrandsForCategory(categoryFilter);
 
     const totals = useMemo(
         () => ({
@@ -301,21 +303,21 @@ export function OverviewBoard({
         [brandStats, positionTopN]
     );
     const displayByVolume = useMemo(
-        () => aggregateStats(brandStats, volumeTopN, totals, "salesVolume", [...OWN_BRANDS], !!categoryFilter),
-        [brandStats, volumeTopN, totals, categoryFilter]
+        () => aggregateStats(brandStats, volumeTopN, totals, "salesVolume", activeOwnBrands, !!categoryFilter),
+        [brandStats, volumeTopN, totals, categoryFilter, activeOwnBrands]
     );
     const displayByRevenue = useMemo(
-        () => aggregateStats(brandStats, revenueTopN, totals, "sales", [...OWN_BRANDS], !!categoryFilter),
-        [brandStats, revenueTopN, totals, categoryFilter]
+        () => aggregateStats(brandStats, revenueTopN, totals, "sales", activeOwnBrands, !!categoryFilter),
+        [brandStats, revenueTopN, totals, categoryFilter, activeOwnBrands]
     );
 
     const salesRevenueDonutData = useMemo(
-        () => buildDonutData(displayByRevenue, "sales", [...OWN_BRANDS], !!categoryFilter),
-        [displayByRevenue, categoryFilter]
+        () => buildDonutData(displayByRevenue, "sales", activeOwnBrands, !!categoryFilter),
+        [displayByRevenue, categoryFilter, activeOwnBrands]
     );
     const salesVolumeDonutData = useMemo(
-        () => buildDonutData(displayByVolume, "salesVolume", [...OWN_BRANDS], !!categoryFilter),
-        [displayByVolume, categoryFilter]
+        () => buildDonutData(displayByVolume, "salesVolume", activeOwnBrands, !!categoryFilter),
+        [displayByVolume, categoryFilter, activeOwnBrands]
     );
     const overviewBusy = dateLoading || overviewLoading;
 
@@ -389,7 +391,7 @@ export function OverviewBoard({
                 formatter: (name: string) => {
                     const value = valueMap.get(name) ?? 0;
                     const label = `${name}  ${formatValue(value)}`;
-                    return name === "EZARC" || name === "TOLESA" ? `{em|${label}}` : `{normal|${label}}`;
+                    return activeOwnBrands.includes(name) ? `{em|${label}}` : `{normal|${label}}`;
                 },
             },
             series: [
@@ -422,6 +424,7 @@ export function OverviewBoard({
         if (brand === "Diablo") return "#1D39C4";
         if (brand === "EZARC") return "#3B9DF8";
         if (brand === "TOLESA") return "#111827";
+        if (brand === "YPLUS") return "#D97706";
         return "#9CA3AF";
     };
 
@@ -599,12 +602,13 @@ export function OverviewBoard({
     }, [siteOpen, categoryOpen, dateOpen]);
 
     const combinedShare = ownShare.toFixed(0);
+    const ownBrandsLabel = activeOwnBrands.join(" + ");
 
     const topCards = [
         {
             title: "Brand Slots",
             value: ownCount.toString(),
-            subLabel: "EZARC + TOLESA",
+            subLabel: ownBrandsLabel,
             bg: "bg-[#3B9DF8]", // Bright Blue
             text: "text-white",
             subText: "text-blue-100",
@@ -622,7 +626,7 @@ export function OverviewBoard({
         {
             title: "Sales volume",
             value: ownSalesVolume.toLocaleString(),
-            subLabel: "EZARC + TOLESA",
+            subLabel: ownBrandsLabel,
             bg: "bg-[#3B9DF8]", // Bright Blue
             text: "text-white",
             subText: "text-blue-100",
@@ -870,7 +874,7 @@ export function OverviewBoard({
                             <div className="space-y-4">
                                 {displayByCount.map((stat, idx) => {
                                     const style = getBrandBarStyle(stat.brand);
-                                    const isOwn = stat.brand === "EZARC" || stat.brand === "TOLESA";
+                                    const isOwn = activeOwnBrands.includes(stat.brand);
                                     return (
                                         <div key={stat.brand} className="flex items-center gap-4">
                                             <div className="w-48">
@@ -999,7 +1003,7 @@ export function OverviewBoard({
                                 </thead>
                                 <tbody className="divide-y divide-gray-50">
                                     {brandStats.map((row, idx) => {
-                                        const isOwn = row.brand === "EZARC" || row.brand === "TOLESA";
+                                        const isOwn = activeOwnBrands.includes(row.brand);
                                         return (
                                             <tr
                                                 key={row.brand}

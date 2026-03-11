@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from ..core.brand_rules import get_own_brands_for_category
 from ..core.config import normalize_site
 from ..repositories import bsr_repo
 from . import user_service
@@ -21,7 +22,6 @@ _BSR_OVERVIEW_CACHE_LOCK = threading.Lock()
 _BSR_MONTHLY_BATCH_CACHE_TTL_SECONDS = 30
 _BSR_MONTHLY_BATCH_CACHE: Dict[tuple[Any, ...], tuple[float, Dict[str, List[Dict[str, Any]]]]] = {}
 _BSR_MONTHLY_BATCH_CACHE_LOCK = threading.Lock()
-_OVERVIEW_OWN_BRANDS = ("EZARC", "TOLESA")
 
 
 def _to_optional_int(value: Any) -> Optional[int]:
@@ -193,6 +193,7 @@ def list_bsr_overview(
 ) -> Dict[str, Any]:
     target_site = normalize_site(site)
     normalized_category = str(category or "").strip() or None
+    own_brand_set = get_own_brands_for_category(normalized_category)
     cache_key = _build_bsr_overview_cache_key(createtime, compare_date, target_site, role, userid, normalized_category)
     now = time.time()
     with _BSR_OVERVIEW_CACHE_LOCK:
@@ -217,8 +218,6 @@ def list_bsr_overview(
     own_sales = 0.0
     own_sales_volume = 0
     own_brand_stats: List[Dict[str, Any]] = []
-    own_brand_set = {brand.upper() for brand in _OVERVIEW_OWN_BRANDS}
-
     for row in current_rows:
         brand = str(row.get("brand") or "").strip() or "Unknown"
         count = to_int(row.get("count"))
@@ -290,9 +289,10 @@ def lookup_bsr_item(
     return {"item": bsr_row_to_item(row), "found": True}
 
 
-def list_bsr_dates(site: str, limit: int, offset: int) -> List[str]:
+def list_bsr_dates(site: str, limit: int, offset: int, category: Optional[str] = None) -> List[str]:
     target_site = normalize_site(site)
-    rows = bsr_repo.fetch_bsr_dates(target_site, limit, offset)
+    normalized_category = str(category or "").strip() or None
+    rows = bsr_repo.fetch_bsr_dates(target_site, limit, offset, normalized_category)
     items: List[str] = []
     for row in rows:
         value = row.get("createtime")

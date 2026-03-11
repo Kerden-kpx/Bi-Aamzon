@@ -4,6 +4,7 @@ export type ProductCategoryRow = {
   level1: string;
   level2: string;
   level3: string;
+  level4?: string | null;
   sort_order: number;
 };
 
@@ -14,21 +15,32 @@ type CascaderOption = {
 };
 
 function buildCategoryTree(rows: ProductCategoryRow[]): CascaderOption[] {
-  const level1Map = new Map<string, Map<string, string[]>>();
-  rows.forEach(({ level1, level2, level3 }) => {
-    if (!level1Map.has(level1)) level1Map.set(level1, new Map<string, string[]>());
+  const level1Map = new Map<string, Map<string, Map<string, string[]>>>();
+  rows.forEach(({ level1, level2, level3, level4 }) => {
+    if (!level1Map.has(level1)) level1Map.set(level1, new Map<string, Map<string, string[]>>());
     const level2Map = level1Map.get(level1)!;
-    if (!level2Map.has(level2)) level2Map.set(level2, []);
-    const level3List = level2Map.get(level2)!;
-    if (!level3List.includes(level3)) level3List.push(level3);
+    if (!level2Map.has(level2)) level2Map.set(level2, new Map<string, string[]>());
+    const level3Map = level2Map.get(level2)!;
+    if (!level3Map.has(level3)) level3Map.set(level3, []);
+    const level4List = level3Map.get(level3)!;
+    const normalizedLevel4 = String(level4 || "").trim();
+    if (normalizedLevel4 && !level4List.includes(normalizedLevel4)) {
+      level4List.push(normalizedLevel4);
+    }
   });
   return Array.from(level1Map.entries()).map(([level1, level2Map]) => ({
     value: level1,
     label: level1,
-    children: Array.from(level2Map.entries()).map(([level2, level3List]) => ({
+    children: Array.from(level2Map.entries()).map(([level2, level3Map]) => ({
       value: level2,
       label: level2,
-      children: level3List.map((level3) => ({ value: level3, label: level3 })),
+      children: Array.from(level3Map.entries()).map(([level3, level4List]) => ({
+        value: level3,
+        label: level3,
+        children: level4List.length > 0
+          ? level4List.map((level4) => ({ value: level4, label: level4 }))
+          : undefined,
+      })),
     })),
   }));
 }
@@ -86,9 +98,12 @@ export function findCategoryPathByLeaf(
   const target = String(category || "").trim();
   if (!target) return undefined;
   const source = rows ?? _rawCache ?? [];
-  const row = source.find((item) => item.level3 === target);
+  const row = source.find((item) => String(item.level4 || "").trim() === target)
+    || source.find((item) => item.level3 === target && !String(item.level4 || "").trim());
   if (!row) return undefined;
-  return [row.level1, row.level2, row.level3];
+  return String(row.level4 || "").trim()
+    ? [row.level1, row.level2, row.level3, String(row.level4 || "").trim()]
+    : [row.level1, row.level2, row.level3];
 }
 
 export function getCategoryLeafFromPath(path: string[] | undefined): string {

@@ -49,10 +49,17 @@ BSR_ITEM_SELECT_COLUMNS_FULL = """
                 b.ad_traffic_count,
                 b.organic_search_terms,
                 b.ad_search_terms,
+                b.all_traffic_terms,
                 b.search_recommend_terms,
                 b.sales_volume,
                 b.sales,
-                b.is_limited_time_deal,
+                b.promotion_tags,
+                CASE
+                    WHEN LOWER(REPLACE(REPLACE(REPLACE(COALESCE(b.promotion_tags, ''), ' ', ''), '-', ''), '_', ''))
+                         LIKE '%%limitedtimedeal%%'
+                    THEN 1
+                    ELSE 0
+                END AS is_limited_time_deal,
                 b.tags,
                 b.type,
                 b.createtime,
@@ -91,7 +98,13 @@ BSR_ITEM_SELECT_COLUMNS_COMPACT = """
                 b.launch_date,
                 b.sales_volume,
                 b.sales,
-                b.is_limited_time_deal,
+                b.promotion_tags,
+                CASE
+                    WHEN LOWER(REPLACE(REPLACE(REPLACE(COALESCE(b.promotion_tags, ''), ' ', ''), '-', ''), '_', ''))
+                         LIKE '%%limitedtimedeal%%'
+                    THEN 1
+                    ELSE 0
+                END AS is_limited_time_deal,
                 b.tags,
                 b.type,
                 b.createtime,
@@ -383,16 +396,25 @@ def fetch_bsr_lookup_row(
     return fetch_one(sql, params)
 
 
-def fetch_bsr_dates(site: str, limit: int, offset: int) -> List[Dict[str, Any]]:
-    sql = """
+def fetch_bsr_dates(site: str, limit: int, offset: int, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    filters = [
+        "site = %s",
+        "createtime IS NOT NULL",
+    ]
+    params: List[Any] = [site]
+    normalized_category = str(category or "").strip() or None
+    if normalized_category:
+        filters.append("category = %s")
+        params.append(normalized_category)
+    where_clause = " AND ".join(filters)
+    sql = f"""
         SELECT DISTINCT createtime
         FROM dim_bi_amazon_item
-        WHERE site = %s
-          AND createtime IS NOT NULL
+        WHERE {where_clause}
         ORDER BY createtime DESC
         LIMIT %s OFFSET %s
     """
-    return fetch_all(sql, (site, limit, offset))
+    return fetch_all(sql, (*params, limit, offset))
 
 
 def fetch_latest_bsr_product_urls(site: str, limit: int = 100) -> List[Dict[str, Any]]:

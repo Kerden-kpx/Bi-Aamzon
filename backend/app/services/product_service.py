@@ -26,7 +26,6 @@ def bsr_has_payload(payload) -> bool:
         "image_url",
         "product_url",
         "brand",
-        "category",
         "price",
         "list_price",
         "score",
@@ -244,7 +243,7 @@ def create_product(payload: YidaProductPayload, creator_userid: str) -> None:
         raise HTTPException(status_code=400, detail="Product name is required")
 
     product_site = normalize_site(raw_site)
-    product_category = payload.category or (payload.bsr.category if payload.bsr else None)
+    product_category = payload.category
     params = (
         payload.asin,
         product_site,
@@ -286,7 +285,7 @@ def create_product(payload: YidaProductPayload, creator_userid: str) -> None:
 
 def update_product(asin: str, site: str, payload: YidaProductPayload) -> int:
     normalized_site = normalize_site(site)
-    product_category = payload.category or (payload.bsr.category if payload.bsr else None)
+    product_category = payload.category
     params = (
         payload.sku or "",
         payload.brand or "",

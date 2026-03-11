@@ -7,3 +7,5 @@ services:
     restart: unless-stopped
     ports:
       - "6184:6184"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

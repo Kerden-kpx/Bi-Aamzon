@@ -4,6 +4,8 @@ from typing import Optional
 import pandas as pd
 import pymysql
 
+from ..core.brand_rules import get_all_own_brands
+
 
 def series_or_default(df: pd.DataFrame, col_name: str, default: str = "") -> pd.Series:
     if col_name in df.columns:
@@ -33,7 +35,8 @@ def series_tags(df: pd.DataFrame, col_names: list[str]) -> pd.Series:
 
 def derive_type_from_brand(brand_series: pd.Series) -> pd.Series:
     normalized = brand_series.fillna("").astype(str).str.strip().str.upper()
-    return normalized.apply(lambda value: 1 if value in {"EZARC", "TOLESA"} else 0)
+    own_brand_set = get_all_own_brands()
+    return normalized.apply(lambda value: 1 if value in own_brand_set else 0)
 
 
 def _extract_count_from_text(series: pd.Series) -> pd.Series:
